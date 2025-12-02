@@ -610,12 +610,12 @@ public class AfMoEModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
     }
-
-    public var loraLayers: [Module] {
-        model.layers
-    }
 }
 
 // MARK: - LoRA Extension
 
-extension AfMoEModel: LoRAModel {}
+extension AfMoEModel: LoRAModel {
+    public var loraLayers: [Module] {
+        model.layers
+    }
+}
