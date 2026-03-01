@@ -17,8 +17,11 @@ enum GraniteMoeHybridLayerType {
     case attention
 }
 
-private func createSSMMask(cache: KVCache?) -> MLXArray? {
-    nil
+private func createSSMMask(cache: KVCache?, sequenceLength: Int) -> MLXArray? {
+    if let arraysCache = cache as? ArraysCache {
+        return arraysCache.makeMask(N: sequenceLength)
+    }
+    return nil
 }
 
 class GraniteMoeHybridRMSNormGated: Module {
@@ -248,8 +251,13 @@ class GraniteMoeHybridAttention: Module {
 
         if let rope {
             if let cache {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
+                if cache.useArrayOffset {
+                    queries = rope(queries, offset: cache.ropeOffset)
+                    keys = rope(keys, offset: cache.ropeOffset)
+                } else {
+                    queries = rope(queries, offset: cache.offset)
+                    keys = rope(keys, offset: cache.offset)
+                }
             } else {
                 queries = rope(queries)
                 keys = rope(keys)
@@ -479,7 +487,8 @@ public class GraniteMoeHybridModelInner: Module {
         let ssmMask = createSSMMask(
             cache: firstMambaIndex.flatMap { index in
                 cache?[index]
-            })
+            },
+            sequenceLength: inputs.dim(1))
 
         for (i, layer) in layers.enumerated() {
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache?[i])

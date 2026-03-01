@@ -30,6 +30,16 @@ class Phi3Attention: Module {
                 return suScaledRoPE(x, offset: offset)
             }
         }
+
+        /// Overload for batched generation with per-sequence offsets
+        func applyEncoding(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+            switch self {
+            case .rope(let rope):
+                return rope.callAsFunction(x, offset: offset)
+            case .suScaledRoPE(let suScaledRoPE):
+                return suScaledRoPE(x, offset: offset)
+            }
+        }
     }
 
     let rope: PositionalEncoding
@@ -95,8 +105,8 @@ class Phi3Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope.applyEncoding(queries, offset: cache.offset)
-            keys = rope.applyEncoding(keys, offset: cache.offset)
+            queries = rope.applyEncoding(queries, offset: cache.ropeOffset)
+            keys = rope.applyEncoding(keys, offset: cache.ropeOffset)
         } else {
             queries = rope.applyEncoding(queries)
             keys = rope.applyEncoding(keys)

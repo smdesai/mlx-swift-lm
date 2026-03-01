@@ -128,8 +128,11 @@ public func segsum(_ x: MLXArray, mask: MLXArray? = nil) -> MLXArray {
     var xSegsum = MLX.cumsum(x, axis: -2)
 
     if let mask = mask {
+        // Expand mask to include heads dimension so outer product
+        // produces (B, 1, L, L) broadcastable with (B, H, L, L)
+        let expandedMask = MLX.expandedDimensions(mask, axis: 1)
         xSegsum = which(
-            mask[.ellipsis, .newAxis, 0...] * mask[.ellipsis, .newAxis],
+            expandedMask[.ellipsis, .newAxis, 0...] * expandedMask[.ellipsis, .newAxis],
             xSegsum,
             MLXArray(-Float.infinity)
         )

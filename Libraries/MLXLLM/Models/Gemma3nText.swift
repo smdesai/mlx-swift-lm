@@ -265,9 +265,9 @@ class Gemma3nAttention: Module {
 
         let offset =
             if isKvSharedLayer && cache != nil {
-                cache!.offset
+                cache!.ropeOffset
             } else {
-                cache?.offset ?? 0
+                cache?.ropeOffset ?? MLXArray(0)
             }
 
         var keys: MLXArray

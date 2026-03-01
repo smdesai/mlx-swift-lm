@@ -92,8 +92,8 @@ class PhiMoEAttention: Module {
         let v = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            q = rope(q, offset: cache.offset)
-            k = rope(k, offset: cache.offset)
+            q = rope(q, offset: cache.ropeOffset)
+            k = rope(k, offset: cache.ropeOffset)
         } else {
             q = rope(q)
             k = rope(k)

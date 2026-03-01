@@ -138,7 +138,7 @@ class GLM4MoELiteAttention: Module {
     let qHeadDim: Int
     var scale: Float
 
-    let rope: OffsetLayer
+    let rope: OffsetLayer & ArrayOffsetLayer
     @ModuleInfo(key: "q_proj") var qProj: Linear?
     @ModuleInfo(key: "q_a_proj") var qAProj: Linear?
     @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm?
@@ -254,9 +254,13 @@ class GLM4MoELiteAttention: Module {
         kPe = kPe.reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
         var kvLatent = kvALayerNorm(compressedKv)
 
-        let offset = cache?.offset ?? 0
-        qPe = rope(qPe, offset: offset)
-        kPe = rope(kPe, offset: offset)
+        if let cache {
+            qPe = rope(qPe, offset: cache.ropeOffset)
+            kPe = rope(kPe, offset: cache.ropeOffset)
+        } else {
+            qPe = rope(qPe, offset: 0)
+            kPe = rope(kPe, offset: 0)
+        }
 
         // Expand kvLatent for attention: [B, L, kvLoraRank] -> [B, 1, L, kvLoraRank]
         kvLatent = expandedDimensions(kvLatent, axis: 1)

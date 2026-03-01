@@ -77,8 +77,8 @@ class MultiHeadCausalAttention: Module {
         }
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
         } else {
             queries = rope(queries)
             keys = rope(keys)

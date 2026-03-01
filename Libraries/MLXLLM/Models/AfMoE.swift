@@ -207,8 +207,8 @@ class AfMoEAttention: Module {
         // Apply RoPE only for local (sliding window) attention
         if isLocalAttention, let rope = rope {
             if let cache = cache {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
+                queries = rope(queries, offset: cache.ropeOffset)
+                keys = rope(keys, offset: cache.ropeOffset)
             } else {
                 queries = rope(queries)
                 keys = rope(keys)

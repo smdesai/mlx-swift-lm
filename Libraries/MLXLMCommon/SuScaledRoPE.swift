@@ -4,7 +4,7 @@ import MLXNN
 
 /// Su Scaled Rotary Position Embedding.
 /// Switches between short and long factors based on sequence length.
-public class SuScaledRoPE: Module, OffsetLayer {
+public class SuScaledRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dimensions: Int
     let originalMaxPositionEmbeddings: Int
     let _shortFreqs: MLXArray
@@ -53,6 +53,28 @@ public class SuScaledRoPE: Module, OffsetLayer {
             freqs = _shortFreqs
             scale = _shortScale
         }
+
+        // Apply scaling only to the dimensions that will be rotated
+        let scaledX = x
+        scaledX[.ellipsis, 0 ..< dimensions] = scale * scaledX[.ellipsis, 0 ..< dimensions]
+
+        return MLXFast.RoPE(
+            scaledX,
+            dimensions: dimensions,
+            traditional: false,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: freqs
+        )
+    }
+
+    /// Overload for batched generation with per-sequence offsets
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        // For batch mode, use long factors by default (conservative choice)
+        // In batch mode we can't easily determine per-sequence lengths
+        let freqs = _longFreqs
+        let scale = _longScale
 
         // Apply scaling only to the dimensions that will be rotated
         let scaledX = x

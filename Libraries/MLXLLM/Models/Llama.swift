@@ -130,6 +130,19 @@ class LlamaDynamicNTKScalingRoPE: Module {
             freqs: freqs
         )
     }
+
+    /// Overload for batched generation with per-sequence offsets
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            x,
+            dimensions: dims,
+            traditional: traditional,
+            base: base,
+            scale: scale,
+            offset: offset,
+            freqs: freqs
+        )
+    }
 }
 
 class LlamaAttention: Module {
@@ -190,8 +203,8 @@ class LlamaAttention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
         } else {
             queries = rope(queries)
             keys = rope(keys)

@@ -197,13 +197,9 @@ class Gemma3Attention: Module {
         queries = queryNorm(queries)
         keys = keyNorm(keys)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
-        }
+        let offset = cache?.offset ?? 0
+        queries = rope(queries, offset: offset)
+        keys = rope(keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

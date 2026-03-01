@@ -39,6 +39,17 @@ public protocol KVCache: Evaluatable {
     /// get the current offset
     var offset: Int { get }
 
+    /// get the per-sequence offset for RoPE positioning
+    /// For single-sequence caches, returns scalar offset as MLXArray
+    /// For batch caches, returns per-sequence offsets [B]
+    var ropeOffset: MLXArray { get }
+
+    /// Whether this cache requires per-batch dynamic RoPE offsets.
+    /// When true, models should use `ropeOffset` (MLXArray) for RoPE.
+    /// When false, models should use `offset` (Int) to avoid the
+    /// mlx_fast_rope_dynamic path which can produce incorrect results.
+    var useArrayOffset: Bool { get }
+
     /// get the maximum size (if any)
     var maxSize: Int? { get }
 
@@ -81,7 +92,7 @@ public protocol KVCache: Evaluatable {
 /// if let quantizedCache = cache as? QuantizedKVCacheProtocol {
 ///     let (qKeys, qValues) = quantizedCache.updateQuantized(keys: k, values: v)
 ///     // Use native quantized operations
-///     let scores = quantizedMM(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
+///     let scores = quantizedMatmul(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
 /// } else {
 ///     // Regular path
 ///     let (k, v) = cache.update(keys: k, values: v)
@@ -119,6 +130,12 @@ public protocol QuantizedKVCacheProtocol: KVCache {
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
+
+    /// Default implementation returns scalar offset as MLXArray
+    open var ropeOffset: MLXArray { MLXArray(Int32(offset)) }
+
+    /// Non-batch caches should use Int offset to avoid mlx_fast_rope_dynamic
+    open var useArrayOffset: Bool { false }
 
     public func innerState() -> [MLXArray] { [] }
 
@@ -158,7 +175,7 @@ open class BaseKVCache: KVCache {
             return .none
         }
 
-        // For multi-token sequences
+        // Use concrete array mask when explicitly requested or for windowed attention
         if returnArray || (windowSize != nil && n > windowSize!) {
             return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
         }
@@ -191,29 +208,103 @@ public func createCausalMask(
     return mask
 }
 
-/// Create an attention mask matching mlx-lm's create_attention_mask helper.
+/// Dynamic roll with per-element shift amounts
+/// Port of Python's dynamic_roll function
 ///
-/// This returns `.causal` when a symbolic mask is sufficient, avoiding
-/// materializing a full mask array.
-public func makeAttentionMask(
+/// - Parameters:
+///   - x: Input array to roll
+///   - shifts: Per-batch shift amounts [B, ...]
+///   - axis: Axis along which to roll
+/// - Returns: Rolled array
+public func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArray {
+    let n = x.dim(axis)
+
+    // Expand shifts to match x trailing dimensions
+    // Python: expand_shifts = (...,) + (None,) * (x.ndim - shifts.ndim)
+    var expandedShifts = shifts
+    for _ in 0 ..< (x.ndim - shifts.ndim) {
+        expandedShifts = expandedDimensions(expandedShifts, axis: -1)
+    }
+
+    // Create indices and expand to match x dimensions
+    // Need n on the gather axis and 1 on all other axes
+    // Python: expand_indices = (None,) * axis + (...,)
+    let indices = MLXArray(0 ..< Int32(n))
+    var expandedIndices = indices
+    // Expand leading dimensions (before axis)
+    for _ in 0 ..< axis {
+        expandedIndices = expandedDimensions(expandedIndices, axis: 0)
+    }
+    // Expand trailing dimensions (after axis) so indices
+    // have the same ndim as x, ensuring takeAlong broadcast works
+    for _ in 0 ..< (x.ndim - axis - 1) {
+        expandedIndices = expandedDimensions(expandedIndices, axis: -1)
+    }
+
+    let shiftedIndices = (expandedIndices - expandedShifts) % n
+
+    // Take along axis
+    return takeAlong(x, shiftedIndices.asType(.int32), axis: axis)
+}
+
+/// Create causal mask with left-padding support for batched inputs
+///
+/// - Parameters:
+///   - n: Sequence length for new tokens
+///   - offset: Current offset in the cache
+///   - leftPadding: Per-sequence left padding amounts [B]
+///   - windowSize: Optional sliding window size
+/// - Returns: Causal attention mask
+public func createBatchCausalMask(
     n: Int,
-    cache: KVCache?,
-    windowSize: Int? = nil,
-    returnArray: Bool = false
-) -> MLXFast.ScaledDotProductAttentionMaskMode {
-    if let cache {
-        return cache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    offset: Int,
+    leftPadding: MLXArray,
+    windowSize: Int? = nil
+) -> MLXArray {
+    var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
+    var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
+    linds = linds[0..., .newAxis]
+    rinds = rinds[.newAxis]
+    var mask = linds .>= rinds
+
+    if let windowSize {
+        mask = mask & (linds .< rinds + windowSize)
     }
 
-    if n == 1 {
-        return .none
-    }
+    // Apply left padding mask: rinds >= leftPadding
+    // leftPadding shape [B], expand to [B, 1, 1, S]
+    let expandedPadding = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+    mask = mask & (rinds .>= expandedPadding)
 
-    if returnArray || (windowSize != nil && n > windowSize!) {
-        return .array(createCausalMask(n: n, offset: 0, windowSize: windowSize))
-    }
+    return mask
+}
 
-    return .causal
+/// Left-pad prompts to the same length
+///
+/// - Parameters:
+///   - prompts: Array of token arrays (variable length)
+///   - maxLength: Optional max length (computed if nil)
+/// - Returns: Left-padded MLXArray [B, maxLength]
+public func leftPadPrompts(_ prompts: [[Int]], maxLength: Int? = nil) -> MLXArray {
+    let maxLen = maxLength ?? prompts.map { $0.count }.max()!
+    let padded = prompts.map { prompt -> [Int] in
+        Array(repeating: 0, count: maxLen - prompt.count) + prompt
+    }
+    return MLXArray(padded.flatMap { $0 }).reshaped([prompts.count, maxLen])
+}
+
+/// Right-pad prompts to the same length
+///
+/// - Parameters:
+///   - prompts: Array of token arrays (variable length)
+///   - maxLength: Optional max length (computed if nil)
+/// - Returns: Right-padded MLXArray [B, maxLength]
+public func rightPadPrompts(_ prompts: [[Int]], maxLength: Int? = nil) -> MLXArray {
+    let maxLen = maxLength ?? prompts.map { $0.count }.max()!
+    let padded = prompts.map { prompt -> [Int] in
+        prompt + Array(repeating: 0, count: maxLen - prompt.count)
+    }
+    return MLXArray(padded.flatMap { $0 }).reshaped([prompts.count, maxLen])
 }
 
 /// Create an attention mask using the parameters from the KVCache.
@@ -427,8 +518,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 /// Rotating KV cache for sliding window attention
 public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var keep: Int
-    private var keys: MLXArray?
-    private var values: MLXArray?
+    internal var keys: MLXArray?
+    internal var values: MLXArray?
     private var maxCacheSize: Int
     private var step: Int
     private var idx: Int = 0
@@ -1033,6 +1124,622 @@ public class ChunkedKVCache: KVCacheSimple {
     }
 }
 
+/// Batch KV cache for parallel sequence processing
+///
+/// Handles multiple sequences with left-padding for variable-length inputs.
+/// The cache expects inputs to be left-padded:
+/// ```
+/// [0, 1, 3, 5]  // prompt [1, 3, 5] with 1 pad
+/// [0, 0, 0, 7]  // prompt [7] with 3 pads
+/// [2, 6, 8, 9]  // prompt [2, 6, 8, 9] with 0 pads
+/// ```
+public class BatchKVCache: BaseKVCache {
+    private var keys: MLXArray?
+    private var values: MLXArray?
+
+    /// Per-sequence left padding amounts [B]
+    public var leftPadding: MLXArray
+
+    /// Per-sequence offsets (can be negative initially) [B]
+    public private(set) var batchOffset: MLXArray
+
+    /// Current write index in cache
+    private var idx: Int = 0
+
+    /// For handling right-padded inputs during prefill
+    private var rightPadding: MLXArray?
+
+    public var step = 256
+
+    /// Debug: layer identifier
+    public var layerId: Int = -1
+
+    /// Returns per-sequence offsets for batched RoPE positioning
+    public override var ropeOffset: MLXArray { batchOffset }
+
+    /// Batch caches require per-sequence dynamic RoPE offsets
+    public override var useArrayOffset: Bool { true }
+
+    /// Initialize with left padding amounts
+    /// - Parameter leftPadding: Amount of left padding for each sequence
+    public init(leftPadding: [Int]) {
+        self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
+        self.batchOffset = MLXArray(leftPadding.map { -Int32($0) })
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        [self.keys, self.values].compactMap { $0 }
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let prev = idx
+
+        if self.keys == nil || (prev + keys.dim(2)) > self.keys!.dim(2) {
+            let B = keys.dim(0)
+            let nKVHeads = keys.dim(1)
+            let kHeadDim = keys.dim(3)
+            let vHeadDim = values.dim(3)
+
+            let nSteps = (step + keys.dim(2) - 1) / step
+            let kShape = [B, nKVHeads, nSteps * step, kHeadDim]
+            let vShape = [B, nKVHeads, nSteps * step, vHeadDim]
+            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
+            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
+
+            if let currentKeys = self.keys, let currentValues = self.values {
+                if prev % step != 0 {
+                    self.keys = currentKeys[.ellipsis, ..<prev, 0...]
+                    self.values = currentValues[.ellipsis, ..<prev, 0...]
+                }
+                self.keys = concatenated([self.keys!, newK], axis: 2)
+                self.values = concatenated([self.values!, newV], axis: 2)
+            } else {
+                self.keys = newK
+                self.values = newV
+            }
+        }
+
+        batchOffset = batchOffset + keys.dim(2)
+        idx += keys.dim(2)
+
+        self.keys![.ellipsis, prev ..< idx, 0...] = keys
+        self.values![.ellipsis, prev ..< idx, 0...] = values
+
+        return (self.keys![.ellipsis, ..<idx, 0...], self.values![.ellipsis, ..<idx, 0...])
+    }
+
+    public override var offset: Int {
+        get { idx }
+        set { idx = newValue }
+    }
+
+    /// Prepare for right-padded inputs (used during multi-token prefill)
+    public func prepare(
+        leftPadding: [Int]? = nil, lengths: [Int]? = nil, rightPadding: [Int]? = nil
+    ) {
+        if let leftPadding {
+            guard self.keys == nil else {
+                fatalError("Left padding can only be added to an empty BatchKVCache")
+            }
+            let lp = MLXArray(leftPadding.map { Int32($0) })
+            self.leftPadding = self.leftPadding + lp
+            self.batchOffset = self.batchOffset - lp
+        }
+
+        if let rightPadding, rightPadding.max()! > 0 {
+            self.rightPadding = MLXArray(rightPadding.map { Int32($0) })
+        }
+    }
+
+    /// Finalize after right-padded prefill - roll to correct positions
+    public func finalize() {
+        guard let rightPadding = self.rightPadding else { return }
+
+        let expandedPadding = rightPadding[0..., .newAxis]
+        self.keys = dynamicRoll(self.keys!, shifts: expandedPadding, axis: 2)
+        self.values = dynamicRoll(self.values!, shifts: expandedPadding, axis: 2)
+
+        self.batchOffset = self.batchOffset - rightPadding
+        self.leftPadding = self.leftPadding + rightPadding
+        self.rightPadding = nil
+    }
+
+    /// Filter to keep only specified batch indices
+    public func filter(batchIndices: MLXArray) {
+        guard let keys = self.keys, let values = self.values else { return }
+
+        self.keys = keys[batchIndices]
+        self.values = values[batchIndices]
+        self.batchOffset = batchOffset[batchIndices]
+        self.leftPadding = leftPadding[batchIndices]
+
+        // Shift left to reduce padding
+        let minLeftPad = leftPadding.min().item(Int32.self)
+        if minLeftPad > 0 {
+            self.keys = self.keys![.ellipsis, Int(minLeftPad)..., 0...]
+            self.values = self.values![.ellipsis, Int(minLeftPad)..., 0...]
+            idx -= Int(minLeftPad)
+            self.leftPadding = self.leftPadding - minLeftPad
+        }
+    }
+
+    /// Extend this cache with another batch cache
+    public func extend(_ other: BatchKVCache) {
+        let maxIdx = max(idx, other.idx)
+        let maxSize = max(keys?.dim(2) ?? 0, other.keys?.dim(2) ?? 0)
+
+        func pad(_ cache: BatchKVCache) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+            let left = maxIdx - cache.idx
+            let right = maxSize - (cache.keys?.dim(2) ?? 0) - left
+
+            var k = cache.keys!
+            var v = cache.values!
+
+            if right < 0 {
+                k = k[.ellipsis, ..<right, 0...]
+                v = v[.ellipsis, ..<right, 0...]
+            }
+
+            if left != 0 || right > 0 {
+                k = padded(k, widths: [[0, 0], [0, 0], [left, max(0, right)], [0, 0]])
+                v = padded(v, widths: [[0, 0], [0, 0], [left, max(0, right)], [0, 0]])
+            }
+
+            let lp = cache.leftPadding + Int32(left)
+            return (k, v, cache.batchOffset, lp)
+        }
+
+        let (k1, v1, o1, lp1) = pad(self)
+        let (k2, v2, o2, lp2) = pad(other)
+
+        self.keys = concatenated([k1, k2], axis: 0)
+        self.values = concatenated([v1, v2], axis: 0)
+        self.batchOffset = concatenated([o1, o2], axis: 0)
+        self.leftPadding = concatenated([lp1, lp2], axis: 0)
+        self.idx = maxIdx
+    }
+
+    /// Extract a single sequence cache at index
+    public func extract(at index: Int) -> KVCacheSimple {
+        let cache = KVCacheSimple()
+        let padding = Int(leftPadding[index].item(Int32.self))
+
+        cache.keys = self.keys![index ..< (index + 1), 0..., padding ..< idx, 0...]
+        cache.values = self.values![index ..< (index + 1), 0..., padding ..< idx, 0...]
+        cache.offset = cache.keys!.dim(2)
+
+        return cache
+    }
+
+    /// Merge individual caches into a batch cache
+    public static func merge(_ caches: [KVCacheSimple]) -> BatchKVCache {
+        let lengths = caches.map { $0.offset }
+        let maxLength = lengths.max()!
+        let padding = lengths.map { maxLength - $0 }
+
+        let B = caches.count
+        guard let firstCache = caches.first(where: { $0.keys != nil }) else {
+            return BatchKVCache(leftPadding: padding)
+        }
+
+        let H = firstCache.keys!.dim(1)
+        let Dk = firstCache.keys!.dim(3)
+        let Dv = firstCache.values!.dim(3)
+        let dt = firstCache.keys!.dtype
+
+        let keys = MLXArray.zeros([B, H, maxLength, Dk], dtype: dt)
+        let values = MLXArray.zeros([B, H, maxLength, Dv], dtype: dt)
+
+        for (i, (p, c)) in zip(padding, caches).enumerated() {
+            if let cKeys = c.keys, let cValues = c.values {
+                keys[i ..< (i + 1), 0..., p ..< (p + c.offset), 0...] =
+                    cKeys[.ellipsis, ..<c.offset, 0...]
+                values[i ..< (i + 1), 0..., p ..< (p + c.offset), 0...] =
+                    cValues[.ellipsis, ..<c.offset, 0...]
+            }
+        }
+
+        let cache = BatchKVCache(leftPadding: padding)
+        cache.keys = keys
+        cache.values = values
+        cache.batchOffset = cache.batchOffset + maxLength
+        cache.idx = maxLength
+
+        return cache
+    }
+
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        // For single-token generation with no padding, use .none like standard caches
+        // This matches KVCacheSimple behavior and avoids unnecessary mask computation
+        if n == 1 {
+            let maxPadding = leftPadding.max().item(Int32.self)
+            if maxPadding == 0 && windowSize == nil {
+                return .none
+            }
+        }
+
+        // For multi-token or padded sequences, create the batch causal mask
+        return .array(
+            createBatchCausalMask(
+                n: n, offset: idx, leftPadding: leftPadding, windowSize: windowSize))
+    }
+
+    public override var isTrimmable: Bool { true }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(idx, n)
+        idx -= trimmed
+        batchOffset = batchOffset - Int32(n)
+        return trimmed
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard let k = keys, let v = values else { return [] }
+            let trimmedK = idx < k.dim(2) ? k[.ellipsis, ..<idx, 0...] : k
+            let trimmedV = idx < v.dim(2) ? v[.ellipsis, ..<idx, 0...] : v
+            return [trimmedK, trimmedV, batchOffset, leftPadding]
+        }
+        set {
+            guard newValue.count == 4 else {
+                fatalError("BatchKVCache state must have exactly 4 arrays")
+            }
+            keys = newValue[0]
+            values = newValue[1]
+            batchOffset = newValue[2]
+            leftPadding = newValue[3]
+            idx = keys!.dim(2)
+        }
+    }
+}
+
+/// Batch rotating KV cache for sliding window attention with multiple sequences
+public class BatchRotatingKVCache: BaseKVCache {
+    private var keys: MLXArray?
+    private var values: MLXArray?
+
+    public var leftPadding: MLXArray
+    public private(set) var batchOffset: MLXArray
+
+    private let maxCacheSize: Int
+    private var idx: Int = 0
+    private var internalOffset: Int = 0
+
+    public override var maxSize: Int? { maxCacheSize }
+    private var rotated: Bool = false
+    private var lengths: MLXArray?
+
+    public var step = 256
+
+    /// Returns per-sequence offsets for batched RoPE positioning
+    public override var ropeOffset: MLXArray { batchOffset }
+
+    /// Batch caches require per-sequence dynamic RoPE offsets
+    public override var useArrayOffset: Bool { true }
+
+    public init(maxSize: Int, leftPadding: [Int]) {
+        self.maxCacheSize = maxSize
+        self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
+        self.batchOffset = MLXArray(leftPadding.map { -Int32($0) })
+        super.init()
+    }
+
+    private func trim(trimSize: Int, _ v: MLXArray, append: MLXArray? = nil) -> MLXArray {
+        var result = v
+        if trimSize > 0 {
+            result = v[.ellipsis, trimSize..., 0...]
+        }
+        if let append = append {
+            return concatenated([result, append], axis: 2)
+        }
+        return result
+    }
+
+    private func temporalOrder() {
+        guard rotated, let k = keys, let v = values else { return }
+        keys = roll(k, shift: -idx, axis: 2)
+        values = roll(v, shift: -idx, axis: 2)
+        idx = k.dim(2)
+        rotated = false
+    }
+
+    private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if self.keys == nil {
+            self.keys = keys
+            self.values = values
+        } else {
+            temporalOrder()
+
+            if self.keys!.dim(2) > idx {
+                self.keys = self.keys![.ellipsis, ..<idx, 0...]
+                self.values = self.values![.ellipsis, ..<idx, 0...]
+            }
+
+            // Handle right-padded sequences
+            if let lengths = self.lengths {
+                let rollAmount = maximum(MLXArray(0), batchOffset - lengths)
+                self.keys = dynamicRoll(self.keys!, shifts: rollAmount[0..., .newAxis], axis: 2)
+                self.values = dynamicRoll(self.values!, shifts: rollAmount[0..., .newAxis], axis: 2)
+                leftPadding = leftPadding + rollAmount
+                batchOffset = batchOffset - rollAmount
+            }
+
+            let trimSize = idx - maxCacheSize + 1
+            if trimSize > 0 {
+                leftPadding = leftPadding - Int32(trimSize)
+            }
+            self.keys = trim(trimSize: trimSize, self.keys!, append: keys)
+            self.values = trim(trimSize: trimSize, self.values!, append: values)
+        }
+
+        batchOffset = batchOffset + keys.dim(2)
+        internalOffset += keys.dim(2)
+        idx = self.keys!.dim(2)
+
+        return (self.keys!, self.values!)
+    }
+
+    private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if lengths != nil {
+            fatalError("finalize() should be called before decoding with BatchRotatingKVCache")
+        }
+
+        let B = keys.dim(0)
+        let nKVHeads = keys.dim(1)
+        let S = keys.dim(2)
+        let kHeadDim = keys.dim(3)
+        let vHeadDim = values.dim(3)
+        let prev = internalOffset
+
+        if self.keys == nil || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize) {
+            let newSize = min(step, maxCacheSize - prev)
+            let kShape = [B, nKVHeads, newSize, kHeadDim]
+            let vShape = [B, nKVHeads, newSize, vHeadDim]
+            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
+            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
+
+            if let currentKeys = self.keys, let currentValues = self.values {
+                self.keys = concatenated([currentKeys, newK], axis: 2)
+                self.values = concatenated([currentValues, newV], axis: 2)
+            } else {
+                self.keys = newK
+                self.values = newV
+            }
+            idx = prev
+        }
+
+        // Trim if needed
+        let trimSize = self.keys!.dim(2) - maxCacheSize
+        if trimSize > 0 {
+            self.keys = trim(trimSize: trimSize, self.keys!)
+            self.values = trim(trimSize: trimSize, self.values!)
+            idx = maxCacheSize
+            leftPadding = leftPadding - Int32(trimSize)
+        }
+
+        // Rotate
+        if idx == maxCacheSize {
+            rotated = true
+            idx = 0
+        }
+        if rotated {
+            leftPadding = leftPadding - Int32(S)
+        }
+
+        // Assign
+        self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
+        self.values![.ellipsis, idx ..< (idx + S), 0...] = values
+        internalOffset += S
+        batchOffset = batchOffset + S
+        idx += S
+
+        if internalOffset < maxCacheSize {
+            return (
+                self.keys![.ellipsis, ..<internalOffset, 0...],
+                self.values![.ellipsis, ..<internalOffset, 0...]
+            )
+        }
+        return (self.keys!, self.values!)
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if keys.dim(2) == 1 {
+            return updateInPlace(keys: keys, values: values)
+        }
+        return updateConcat(keys: keys, values: values)
+    }
+
+    public override var offset: Int {
+        get { min(internalOffset, maxCacheSize) }
+        set { internalOffset = newValue }
+    }
+
+    public func prepare(
+        leftPadding: [Int]? = nil, lengths: [Int]? = nil, rightPadding: [Int]? = nil
+    ) {
+        if let leftPadding {
+            guard self.keys == nil else {
+                fatalError("Left padding can only be added to an empty BatchRotatingKVCache")
+            }
+            let lp = MLXArray(leftPadding.map { Int32($0) })
+            self.leftPadding = self.leftPadding + lp
+            self.batchOffset = self.batchOffset - lp
+        }
+
+        if let rightPadding, rightPadding.max()! > 0, let lengths = lengths {
+            self.lengths = MLXArray(lengths.map { Int32($0) }) + batchOffset
+        }
+    }
+
+    public func finalize() {
+        guard let lengths = self.lengths else { return }
+
+        let rollAmount = maximum(MLXArray(0), batchOffset - lengths)
+        self.keys = dynamicRoll(self.keys!, shifts: rollAmount[0..., .newAxis], axis: 2)
+        self.values = dynamicRoll(self.values!, shifts: rollAmount[0..., .newAxis], axis: 2)
+        leftPadding = leftPadding + rollAmount
+        batchOffset = batchOffset - rollAmount
+        self.lengths = nil
+    }
+
+    public func filter(batchIndices: MLXArray) {
+        keys = keys?[batchIndices]
+        values = values?[batchIndices]
+        batchOffset = batchOffset[batchIndices]
+        leftPadding = leftPadding[batchIndices]
+    }
+
+    public func extend(_ other: BatchRotatingKVCache) {
+        if rotated != other.rotated || idx != other.idx {
+            temporalOrder()
+            other.temporalOrder()
+        }
+
+        let maxIdx = max(idx, other.idx)
+        let maxCacheSize = max(keys?.dim(2) ?? 0, other.keys?.dim(2) ?? 0)
+
+        func pad(_ cache: BatchRotatingKVCache) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+            let left = maxIdx - cache.idx
+            let right = maxCacheSize - (cache.keys?.dim(2) ?? 0) - left
+
+            var k = cache.keys!
+            var v = cache.values!
+
+            if right < 0 {
+                k = k[.ellipsis, ..<right, 0...]
+                v = v[.ellipsis, ..<right, 0...]
+            }
+
+            if left != 0 || right > 0 {
+                k = padded(k, widths: [[0, 0], [0, 0], [left, max(0, right)], [0, 0]])
+                v = padded(v, widths: [[0, 0], [0, 0], [left, max(0, right)], [0, 0]])
+            }
+
+            let lp = cache.leftPadding + Int32(left)
+            return (k, v, cache.batchOffset, lp)
+        }
+
+        let (k1, v1, o1, lp1) = pad(self)
+        let (k2, v2, o2, lp2) = pad(other)
+
+        self.keys = concatenated([k1, k2], axis: 0)
+        self.values = concatenated([v1, v2], axis: 0)
+        self.batchOffset = concatenated([o1, o2], axis: 0)
+        self.leftPadding = concatenated([lp1, lp2], axis: 0)
+        self.idx = maxIdx
+        self.internalOffset = max(internalOffset, other.internalOffset)
+    }
+
+    public func extract(at index: Int) -> RotatingKVCache {
+        let cache = RotatingKVCache(maxSize: maxCacheSize)
+        let padding = Int(leftPadding[index].item(Int32.self))
+
+        cache.keys = keys?[index ..< (index + 1)]
+        cache.values = values?[index ..< (index + 1)]
+
+        if rotated {
+            cache.keys = roll(cache.keys!, shift: -idx, axis: 2)
+            cache.values = roll(cache.values!, shift: -idx, axis: 2)
+        }
+
+        if padding > 0 {
+            cache.keys = cache.keys![.ellipsis, padding ..< (cache.keys!.dim(2)), 0...]
+            cache.values = cache.values![.ellipsis, padding ..< (cache.values!.dim(2)), 0...]
+        }
+
+        cache.offset = Int(batchOffset[index].item(Int32.self))
+
+        return cache
+    }
+
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        let actualWindowSize = windowSize ?? maxCacheSize
+        let cappedOffset = min(maxCacheSize - 1, internalOffset)
+
+        var rinds = MLXArray(Int32(0) ..< Int32(cappedOffset + n))
+        var linds =
+            cappedOffset != 0 ? MLXArray(Int32(cappedOffset) ..< Int32(cappedOffset + n)) : rinds
+        linds = linds[0..., .newAxis]
+        rinds = rinds[.newAxis]
+
+        var mask = linds .>= rinds
+        mask = mask & (linds .< rinds + actualWindowSize)
+
+        var adjustedLeftPadding = leftPadding
+        let trimSize = idx - maxCacheSize + (n > 1 ? 1 : 0)
+        if trimSize > 0 {
+            adjustedLeftPadding = adjustedLeftPadding - Int32(trimSize)
+        }
+
+        let isRotated = n == 1 && (rotated || idx >= maxCacheSize)
+        if isRotated {
+            adjustedLeftPadding = adjustedLeftPadding - 1
+        }
+
+        let expandedPadding = adjustedLeftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (rinds .>= expandedPadding)
+
+        if isRotated {
+            var currentIdx = idx
+            if currentIdx >= maxCacheSize {
+                currentIdx = 0
+            }
+            mask = roll(mask, shift: currentIdx + 1, axis: -1)
+        }
+
+        return .array(mask)
+    }
+
+    public override var isTrimmable: Bool { internalOffset < maxCacheSize }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(internalOffset, n)
+        internalOffset -= trimmed
+        idx -= trimmed
+        batchOffset = batchOffset - Int32(n)
+        return trimmed
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard let k = keys, let v = values else { return [] }
+            let trimmedK = internalOffset < k.dim(2) ? k[.ellipsis, ..<internalOffset, 0...] : k
+            let trimmedV = internalOffset < v.dim(2) ? v[.ellipsis, ..<internalOffset, 0...] : v
+            return [trimmedK, trimmedV, batchOffset, leftPadding]
+        }
+        set {
+            guard newValue.count == 4 else {
+                fatalError("BatchRotatingKVCache state must have exactly 4 arrays")
+            }
+            keys = newValue[0]
+            values = newValue[1]
+            batchOffset = newValue[2]
+            leftPadding = newValue[3]
+        }
+    }
+
+    public override var metaState: [String] {
+        get {
+            [String(maxCacheSize), String(internalOffset), String(idx), String(rotated)]
+        }
+        set {
+            guard newValue.count == 4 else {
+                fatalError("BatchRotatingKVCache metaState must have exactly 4 values")
+            }
+            internalOffset = Int(newValue[1]) ?? 0
+            idx = Int(newValue[2]) ?? 0
+            rotated = newValue[3] == "true"
+        }
+    }
+}
+
 /// Base cache for array-based state storage
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
@@ -1144,6 +1851,16 @@ public class CacheList: BaseKVCache {
         }
         return result
     }
+
+    /// Delegate to first cache for RoPE offset (attention cache in hybrid models)
+    public override var ropeOffset: MLXArray {
+        caches.first?.ropeOffset ?? MLXArray(Int32(0))
+    }
+
+    /// Delegate to first cache for array offset flag
+    public override var useArrayOffset: Bool {
+        caches.first?.useArrayOffset ?? false
+    }
 }
 
 // MARK: - Error Types
@@ -1178,6 +1895,10 @@ public func savePromptCache(
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
+        case is BatchKVCache:
+            return "BatchKVCache"
+        case is BatchRotatingKVCache:
+            return "BatchRotatingKVCache"
         case is MambaCache:
             return "MambaCache"  // Must precede ArraysCache because of inheritance
         case is ArraysCache:
@@ -1280,6 +2001,15 @@ public func loadPromptCache(
             cache = QuantizedKVCache()
         case "ChunkedKVCache":
             cache = ChunkedKVCache()
+        case "BatchKVCache":
+            cache = BatchKVCache(leftPadding: [])
+        case "BatchRotatingKVCache":
+            // Parse metaState first to get maxSize
+            let info = i < cacheInfo.count ? cacheInfo[i] : []
+            guard info.count >= 4, let maxSize = Int(info[0]) else {
+                throw KVCacheError(message: "Invalid BatchRotatingKVCache metaState")
+            }
+            cache = BatchRotatingKVCache(maxSize: maxSize, leftPadding: [])
         case "MambaCache":
             cache = MambaCache()
         case "ArraysCache":
@@ -1484,7 +2214,7 @@ public func quantizedScaledDotProductAttention(
     }
 
     // Compute attention scores using quantized matmul
-    var scores = quantizedMM(
+    var scores = quantizedMatmul(
         scaledQueries, qKeys.0, scales: qKeys.1, biases: qKeys.2,
         transpose: true, groupSize: groupSize, bits: bits,
         mode: mode
@@ -1524,7 +2254,7 @@ public func quantizedScaledDotProductAttention(
     let attentionWeights = softmax(scores, axis: -1)
 
     // Compute output using quantized matmul
-    var output = quantizedMM(
+    var output = quantizedMatmul(
         attentionWeights, qValues.0, scales: qValues.1, biases: qValues.2,
         transpose: false, groupSize: groupSize, bits: bits,
         mode: mode

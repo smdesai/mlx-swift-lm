@@ -41,7 +41,7 @@ class Mistral3Attention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: OffsetLayer
+    let rope: OffsetLayer & ArrayOffsetLayer
 
     init(_ args: Mistral3TextConfiguration) {
         self.args = args
@@ -87,9 +87,13 @@ class Mistral3Attention: Module {
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
         // Apply RoPE
-        let offset = cache?.offset ?? 0
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
+        if let cache {
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
+        } else {
+            queries = rope(queries, offset: 0)
+            keys = rope(keys, offset: 0)
+        }
 
         // Apply attention scaling
         queries = queries * attnScale

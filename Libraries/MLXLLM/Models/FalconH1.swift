@@ -305,8 +305,13 @@ class FalconH1Attention: Module {
         values = values.reshaped(B, L, numKVHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            if cache.useArrayOffset {
+                queries = rope(queries, offset: cache.ropeOffset)
+                keys = rope(keys, offset: cache.ropeOffset)
+            } else {
+                queries = rope(queries, offset: cache.offset)
+                keys = rope(keys, offset: cache.offset)
+            }
             (keys, values) = cache.update(keys: keys, values: values)
         } else {
             queries = rope(queries)
@@ -614,13 +619,18 @@ private func createSSMMask(h: MLXArray, cache: ArraysCache?) -> MLXArray? {
 
 private func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
     let N = h.dim(1)
-    // If cache exists and can make masks, use it
-    // Otherwise for single token, no mask needed
-    // For multi-token, SDPA will handle causal mask internally when nil
     if N == 1 {
         return nil
     }
-    return nil  // Will be handled by SDPA internally when nil
+    // Must create an explicit causal mask for multi-token prefill.
+    // MLX's scaledDotProductAttention does NOT auto-apply causal masking
+    // when mask is nil — it performs bidirectional attention, which corrupts
+    // autoregressive model outputs (especially for longer sequences).
+    var offset = 0
+    if let c = cache?.first {
+        offset = c.offset
+    }
+    return createCausalMask(n: N, offset: offset)
 }
 
 // MARK: - Model

@@ -251,8 +251,8 @@ class AttentionBlock: Module {
         }
 
         if let cache {
-            q = rope(q, offset: cache.offset)
-            k = rope(k, offset: cache.offset)
+            q = rope(q, offset: cache.ropeOffset)
+            k = rope(k, offset: cache.ropeOffset)
             (k, v) = cache.update(keys: k, values: v)
         } else {
             q = rope(q)
@@ -381,7 +381,6 @@ public class GPTOSSModelInner: Module {
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
-        let seqLen = x.dim(1)
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
         var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
 
@@ -391,8 +390,8 @@ public class GPTOSSModelInner: Module {
                 maskMode = mask
             } else if layerTypes[i] == "full_attention" {
                 if fullMask == nil {
-                    fullMask = makeAttentionMask(
-                        n: seqLen,
+                    fullMask = createAttentionMask(
+                        h: x,
                         cache: cache[fullAttentionIndex],
                         windowSize: nil
                     )
@@ -400,8 +399,8 @@ public class GPTOSSModelInner: Module {
                 maskMode = fullMask!
             } else {
                 if slidingMask == nil {
-                    slidingMask = makeAttentionMask(
-                        n: seqLen,
+                    slidingMask = createAttentionMask(
+                        h: x,
                         cache: cache[slidingAttentionIndex],
                         windowSize: windowSize
                     )

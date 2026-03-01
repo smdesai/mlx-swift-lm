@@ -58,8 +58,8 @@ class PhiAttention: Module {
 
         // Add RoPE to the queries and keys and combine them with the cache
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
         } else {
             queries = rope(queries)
             keys = rope(keys)

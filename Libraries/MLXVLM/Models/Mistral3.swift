@@ -84,7 +84,7 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     public var vocabSize: Int { _vocabSize ?? 32000 }
     public var spatialMergeSize: Int { _spatialMergeSize ?? 2 }
     public var multimodalProjectorBias: Bool { _multimodalProjectorBias ?? false }
-    public var eosTokenId: [Int]? { _eosTokenId }
+    public var eosTokenId: [Int]? { _eosTokenId?.values }
 
     private let _ignoreIndex: Int?
     private let _imageTokenIndex: Int?
@@ -94,7 +94,7 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     private let _vocabSize: Int?
     private let _spatialMergeSize: Int?
     private let _multimodalProjectorBias: Bool?
-    private let _eosTokenId: [Int]?
+    private let _eosTokenId: IntOrIntArray?
 
     enum CodingKeys: String, CodingKey {
         case textConfig = "text_config"
@@ -305,7 +305,11 @@ private enum Language {
         @ModuleInfo(key: "v_proj") var wv: Linear
         @ModuleInfo(key: "o_proj") var wo: Linear
 
+        @ModuleInfo(key: "q_norm") var qNorm: RMSNorm?
+        @ModuleInfo(key: "k_norm") var kNorm: RMSNorm?
+
         let rope: Module
+        let useQkNorm: Bool
 
         init(_ config: Mistral3VLMTextConfiguration) {
             self.config = config
@@ -321,6 +325,12 @@ private enum Language {
             self._wk.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
             self._wv.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
             self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
+
+            self.useQkNorm = config.useQkNorm
+            if config.useQkNorm {
+                self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
+                self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
+            }
 
             // Initialize RoPE using rope_parameters - rope_theta is required like in Python
             guard let ropeParams = config.ropeParameters,
@@ -362,8 +372,13 @@ private enum Language {
             var keys = wk(x)
             var values = wv(x)
 
-            queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
-            keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            if useQkNorm, let qNorm, let kNorm {
+                queries = qNorm(queries.reshaped(B, L, nHeads, -1)).transposed(0, 2, 1, 3)
+                keys = kNorm(keys.reshaped(B, L, nKVHeads, -1)).transposed(0, 2, 1, 3)
+            } else {
+                queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+                keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            }
             values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0
@@ -651,8 +666,10 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         // Process through vision tower (reuses Pixtral vision model)
+        let visionInput = pixelValues.transposed(0, 2, 3, 1)
+
         let (_, _, hiddenStates) = visionTower(
-            pixelValues.transposed(0, 2, 3, 1),
+            visionInput,
             outputHiddenStates: true
         )
 
@@ -671,12 +688,13 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         let imageFeatures = multiModalProjector(selectedFeatures, imageSizes: imageSizes)
 
         // Merge embeddings
-        return mergeInputIdsWithImageFeatures(
+        let merged = mergeInputIdsWithImageFeatures(
             imageTokenIndex: config.imageTokenIndex,
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
             inputIds: inputIds
         )
+        return merged
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -925,6 +943,8 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         let pixels: MLXArray  // BCHW
         let frames: [THW]
         let numImageTokens: Int
+        let numPatchRows: Int
+        let numPatchCols: Int
     }
 
     public init(_ config: Mistral3VLMProcessorConfiguration, tokenizer: any Tokenizer) {
@@ -949,33 +969,36 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         var image = MediaProcessing.inSRGBToneCurveSpace(image)
         image = MediaProcessing.apply(image, processing: processing)
 
-        let maxVisionEdge = patchSize * 24  // Pixtral vision expects 24x24 patches (336px for patchSize=14)
-        let targetEdge = min(longestEdge ?? maxVisionEdge, maxVisionEdge)
+        let defaultEdge = patchSize * 24
+        let targetEdge = longestEdge ?? defaultEdge
 
         let originalSize = image.extent.size
-        let scale = min(CGFloat(targetEdge) / max(originalSize.width, originalSize.height), 1.0)
-        let newWidth = max(1, Int((originalSize.width * scale).rounded()))
-        let newHeight = max(1, Int((originalSize.height * scale).rounded()))
+        let height = Int(originalSize.height)
+        let width = Int(originalSize.width)
 
-        // Round to patch size multiples for padding
-        let paddedWidth = ((newWidth + patchSize - 1) / patchSize) * patchSize
-        let paddedHeight = ((newHeight + patchSize - 1) / patchSize) * patchSize
+        // Match Python PixtralProcessor: downscale only if needed (floor rounding)
+        let ratio = max(Double(height) / Double(targetEdge), Double(width) / Double(targetEdge))
+        var scaledHeight = height
+        var scaledWidth = width
+        if ratio > 1.0 {
+            scaledHeight = Int(Double(height) / ratio)
+            scaledWidth = Int(Double(width) / ratio)
+        }
 
-        // Resize
+        // Match Python PixtralProcessor: use effective patch = patchSize * spatialMergeSize
+        // for computing the output size, then RESIZE directly (no padding).
+        // Python: num_tokens = (dim - 1) // effective_patch + 1  (ceiling division)
+        let effectivePatch = patchSize * spatialMergeSize
+        let numPatchesH = (scaledHeight - 1) / effectivePatch + 1
+        let numPatchesW = (scaledWidth - 1) / effectivePatch + 1
+        let targetHeight = numPatchesH * effectivePatch
+        let targetWidth = numPatchesW * effectivePatch
+
+        // Resize directly to patch-aligned dimensions (matching Python behavior)
         image = MediaProcessing.resampleBicubic(
             image,
-            to: CGSize(width: newWidth, height: newHeight)
+            to: CGSize(width: targetWidth, height: targetHeight)
         )
-
-        // Pad to patch boundaries (bottom-right padding)
-        if newWidth != paddedWidth || newHeight != paddedHeight {
-            let background = CIImage(color: .black).cropped(
-                to: CGRect(x: 0, y: 0, width: paddedWidth, height: paddedHeight))
-            let tx = 0.0
-            let ty = CGFloat(paddedHeight - newHeight)
-            let transformed = image.transformed(by: CGAffineTransform(translationX: tx, y: ty))
-            image = transformed.composited(over: background)
-        }
 
         image = MediaProcessing.normalize(
             image,
@@ -997,16 +1020,14 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         }
 
         // Calculate number of image tokens needed after spatial merging
-        let numPatchesH = paddedHeight / patchSize
-        let numPatchesW = paddedWidth / patchSize
-        let mergedPatchesH = numPatchesH / spatialMergeSize
-        let mergedPatchesW = numPatchesW / spatialMergeSize
-        let numImageTokens = mergedPatchesH * mergedPatchesW
+        let numImageTokens = numPatchesH * numPatchesW
 
         return PreprocessResult(
             pixels: pixels,
-            frames: [THW(1, paddedHeight, paddedWidth)],
-            numImageTokens: numImageTokens
+            frames: [THW(1, targetHeight, targetWidth)],
+            numImageTokens: numImageTokens,
+            numPatchRows: numPatchesH,
+            numPatchCols: numPatchesW
         )
     }
 
@@ -1028,11 +1049,37 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         let spatialMergeSize = config.spatialMergeSize ?? 2
         let patchSize = config.imageProcessor.patchSize
 
-        // Apply chat template to get tokenized prompt with image placeholder
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        // Manually construct the prompt text matching Python's PixtralProcessor output.
+        // The Swift Jinja renderer produces extra newlines that corrupt tokenization,
+        // so we bypass applyChatTemplate and encode the text directly.
+        var systemText: String? = nil
+        var userText = ""
+        if case .chat(let chatMessages) = input.prompt {
+            for message in chatMessages {
+                switch message.role {
+                case .system:
+                    systemText = message.content
+                case .user:
+                    userText = message.content
+                default:
+                    break
+                }
+            }
+        }
 
-        // Decode to find and replace image placeholder token
-        let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+        var promptText = ""
+        if let systemText, !systemText.isEmpty {
+            promptText += "<|im_start|>system\n\(systemText)<|im_end|>\n"
+        } else {
+            promptText += "<|im_start|>system<|im_end|>\n"
+        }
+        promptText += "<|im_start|>user\n"
+        // Single image placeholder - will be expanded at token level below
+        promptText += imageToken
+        promptText += userText + "\n<|im_end|>\n"
+        promptText += "<|im_start|>assistant\n"
+
+        var promptTokens = tokenizer.encode(text: promptText, addSpecialTokens: false)
 
         // Process image to get dimensions
         let preprocessResult = try preprocessImage(
@@ -1043,58 +1090,49 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
             longestEdge: config.imageProcessor.size.longestEdge
         )
 
-        // Replace the image placeholder token with the correct number of image tokens
-        // The chat template should have inserted the imageToken (e.g., "[IMG]") which we need to expand
-        if decoded.contains(imageToken) {
-            // Split by image token and re-encode with expanded image tokens
-            let pieces = decoded.components(separatedBy: imageToken)
-            var expandedTokens: [Int] = []
+        // Build the expanded image token sequence matching Python's PixtralProcessor:
+        // Each row: [image_pad] * numCols + [image_break_token]
+        // Last row ends with [image_end_token] instead of [image_break_token]
+        let imageBreakTokenId = config.imageBreakToken.flatMap {
+            tokenizer.convertTokenToId($0)
+        }
+        let imageEndTokenId = config.imageEndToken.flatMap {
+            tokenizer.convertTokenToId($0)
+        }
 
-            for (index, piece) in pieces.enumerated() {
-                if !piece.isEmpty {
-                    let pieceTokens = tokenizer.encode(text: piece)
-                    expandedTokens.append(contentsOf: pieceTokens)
+        var imageTokenSequence: [Int] = []
+        for row in 0 ..< preprocessResult.numPatchRows {
+            imageTokenSequence.append(
+                contentsOf: Array(
+                    repeating: imageTokenId, count: preprocessResult.numPatchCols))
+            if row < preprocessResult.numPatchRows - 1 {
+                if let breakId = imageBreakTokenId {
+                    imageTokenSequence.append(breakId)
                 }
-                // Add image tokens between pieces (not after the last one)
-                if index < pieces.count - 1 {
-                    expandedTokens.append(
-                        contentsOf: Array(
-                            repeating: imageTokenId, count: preprocessResult.numImageTokens))
-                }
-            }
-            promptTokens = expandedTokens
-        } else {
-            // Fallback: If no image token placeholder found, try to find and replace the single image token ID
-            // or insert at the beginning after BOS
-            var foundImageToken = false
-            var expandedTokens: [Int] = []
-
-            for token in promptTokens {
-                if token == imageTokenId && !foundImageToken {
-                    // Replace single image token with expanded tokens
-                    expandedTokens.append(
-                        contentsOf: Array(
-                            repeating: imageTokenId, count: preprocessResult.numImageTokens))
-                    foundImageToken = true
-                } else {
-                    expandedTokens.append(token)
-                }
-            }
-
-            if foundImageToken {
-                promptTokens = expandedTokens
             } else {
-                // Last resort: insert image tokens after BOS (if present) or at start
-                var insertIndex = 0
-                if !promptTokens.isEmpty && promptTokens[0] == 1 {
-                    insertIndex = 1  // After BOS token
+                if let endId = imageEndTokenId {
+                    imageTokenSequence.append(endId)
                 }
-                promptTokens.insert(
-                    contentsOf: Array(
-                        repeating: imageTokenId, count: preprocessResult.numImageTokens),
-                    at: insertIndex
-                )
             }
+        }
+
+        // Expand image tokens at the token level (no decode/re-encode to avoid corruption).
+        // Find the first image token ID in promptTokens and replace it with the full sequence.
+        if let firstImageIdx = promptTokens.firstIndex(of: imageTokenId) {
+            // Find the contiguous run of image tokens starting from firstImageIdx
+            var endIdx = firstImageIdx
+            while endIdx < promptTokens.count && promptTokens[endIdx] == imageTokenId {
+                endIdx += 1
+            }
+            // Replace the run with the expanded image token sequence
+            promptTokens.replaceSubrange(firstImageIdx ..< endIdx, with: imageTokenSequence)
+        } else {
+            // No image token found, insert at start (after BOS if present)
+            var insertIndex = 0
+            if !promptTokens.isEmpty && promptTokens[0] == 1 {
+                insertIndex = 1
+            }
+            promptTokens.insert(contentsOf: imageTokenSequence, at: insertIndex)
         }
 
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)

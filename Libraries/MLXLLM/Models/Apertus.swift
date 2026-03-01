@@ -232,6 +232,19 @@ private class DynamicNTKScalingRoPE: Module {
             freqs: freqs
         )
     }
+
+    /// Overload for batched generation with per-sequence offsets
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            x,
+            dimensions: dims,
+            traditional: traditional,
+            base: base,
+            scale: scale,
+            offset: offset,
+            freqs: freqs
+        )
+    }
 }
 
 private class ApertusAttention: Module {
@@ -314,8 +327,8 @@ private class ApertusAttention: Module {
 
         // 4. RoPE
         if let cache = cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
 
             // Update cache (expects [B, H, L, D])
             let (k, v) = cache.update(keys: keys, values: values)

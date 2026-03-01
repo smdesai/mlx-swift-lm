@@ -96,6 +96,7 @@ public enum VLMTypeRegistry {
         "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
     ])
 }
 
@@ -125,6 +126,8 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        "Glm46VProcessor": create(
+            GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
     ])
 }
 

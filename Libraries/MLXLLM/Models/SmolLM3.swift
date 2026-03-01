@@ -12,6 +12,7 @@ import MLXNN
 
 protocol SmolLM3PositionEmbedding {
     func callAsFunction(_ x: MLXArray, offset: Int) -> MLXArray
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray
     func callAsFunction(_ x: MLXArray) -> MLXArray
 }
 
@@ -21,6 +22,10 @@ extension RoPE: SmolLM3PositionEmbedding {}
 
 final class NoPE: Module, SmolLM3PositionEmbedding {
     func callAsFunction(_ x: MLXArray, offset: Int) -> MLXArray {
+        return x
+    }
+
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         return x
     }
 
@@ -79,8 +84,8 @@ class SmolLM3Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
         } else {
             queries = rope(queries)
             keys = rope(keys)

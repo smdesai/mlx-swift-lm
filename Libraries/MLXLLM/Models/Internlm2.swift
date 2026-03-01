@@ -36,6 +36,15 @@ class Internlm2DynamicNTKScalingRoPE: Module {
         return MLXFast.RoPE(
             x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     }
+
+    /// Overload for batched generation with per-sequence offsets
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        // For batch mode, use the original base (conservative approach)
+        // The dynamic scaling would require per-sequence computation
+        return MLXFast.RoPE(
+            x, dimensions: dims, traditional: traditional, base: originalBase, scale: scale,
+            offset: offset)
+    }
 }
 
 class Internlm2Attention: Module {
@@ -107,8 +116,8 @@ class Internlm2Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: cache.ropeOffset)
+            keys = rope(keys, offset: cache.ropeOffset)
         } else {
             queries = rope(queries)
             keys = rope(keys)

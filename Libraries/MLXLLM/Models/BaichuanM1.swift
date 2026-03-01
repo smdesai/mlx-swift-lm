@@ -111,12 +111,12 @@ class BaichuanM1Attention: Module {
         var keys = qkv[1].reshaped(B, L, numKVHeads, headDim).transposed(0, 2, 1, 3)
         var values = qkv[2].reshaped(B, L, numKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        var offset = 0
+        var offset: MLXArray = MLXArray(0)
         var lastK: MLXArray? = nil
         var lastV: MLXArray? = nil
 
         if let cacheList = cache as? CacheList {
-            offset = cacheList[1].offset
+            offset = cacheList[1].ropeOffset
             if let mambaCache = cacheList[0] as? MambaCache {
                 lastK = mambaCache[0]
                 lastV = mambaCache[1]

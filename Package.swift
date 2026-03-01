@@ -26,10 +26,15 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
+        //.package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
+        .package(path: "/Users/sachin/Tools/MLX/experimental-batch/mlx-swift"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.1.6")
+        ),
+        .package(
+            url: "https://github.com/apple/swift-argument-parser",
+            from: "1.3.0"
         ),
     ],
     targets: [
@@ -98,6 +103,30 @@ let package = Package(
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
+        ),
+        .executableTarget(
+            name: "BatchGenerate",
+            dependencies: [
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools/BatchGenerate"
+        ),
+        .executableTarget(
+            name: "VLMGenerate",
+            dependencies: [
+                "MLXVLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools/VLMGenerate"
         ),
         .testTarget(
             name: "MLXLMTests",

@@ -93,6 +93,19 @@ class Olmo2DynamicNTKScalingRoPE: Module {
             freqs: freqs
         )
     }
+
+    /// Overload for batched generation with per-sequence offsets
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            x,
+            dimensions: dims,
+            traditional: traditional,
+            base: base,
+            scale: scale,
+            offset: offset,
+            freqs: freqs
+        )
+    }
 }
 
 // MARK: - Attention
@@ -193,6 +206,13 @@ class Olmo2Attention: Module {
         return x
     }
 
+    /// Overload for batched generation with per-sequence offsets
+    func applyRoPE(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        if let ropeYarn { return ropeYarn(x, offset: offset) }
+        if let ropeDynamic { return ropeDynamic(x, offset: offset) }
+        return x
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -207,8 +227,8 @@ class Olmo2Attention: Module {
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = applyRoPE(queries, offset: cache.offset)
-            keys = applyRoPE(keys, offset: cache.offset)
+            queries = applyRoPE(queries, offset: cache.ropeOffset)
+            keys = applyRoPE(keys, offset: cache.ropeOffset)
         } else {
             queries = applyRoPE(queries, offset: nil)
             keys = applyRoPE(keys, offset: nil)

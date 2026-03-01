@@ -225,13 +225,9 @@ public final class Qwen3NextAttention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
-        }
+        let offset = cache?.offset ?? 0
+        queries = rope(queries, offset: offset)
+        keys = rope(keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

@@ -148,6 +148,19 @@ class DeepseekV3YarnRotaryEmbedding: Module {
             freqs: self._freqs
         )
     }
+
+    /// Overload for batched generation with per-sequence offsets
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            self.mscale != 1.0 ? self.mscale * x : x,
+            dimensions: x.shape.last ?? 0,
+            traditional: true,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: self._freqs
+        )
+    }
 }
 
 private func clippedSilu(_ x: MLXArray) -> MLXArray {
@@ -276,8 +289,8 @@ class DeepseekV3Attention: Module {
 
         var keys: MLXArray
         if let cache = cache {
-            qPe = self.rope(qPe, offset: cache.offset)
-            kPe = self.rope(kPe, offset: cache.offset)
+            qPe = self.rope(qPe, offset: cache.ropeOffset)
+            kPe = self.rope(kPe, offset: cache.ropeOffset)
             kPe = repeated(kPe, count: numHeads, axis: 1)
             (keys, values) = cache.update(
                 keys: concatenated([kNope, kPe], axis: -1), values: values)

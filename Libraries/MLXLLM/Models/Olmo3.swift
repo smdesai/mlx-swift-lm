@@ -29,7 +29,7 @@ class Olmo3Attention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rope: OffsetLayer
+    let rope: Module
 
     init(_ args: Olmo3Configuration, layerIdx: Int) {
         self.args = args
@@ -65,6 +65,29 @@ class Olmo3Attention: Module {
         super.init()
     }
 
+    private func applyRoPE(_ x: MLXArray, offset: Int?) -> MLXArray {
+        if let llama3Rope = rope as? Llama3RoPE {
+            return llama3Rope(x, offset: offset ?? 0)
+        } else if let yarnRope = rope as? YarnRoPE {
+            return yarnRope(x, offset: offset ?? 0)
+        } else if let basicRope = rope as? RoPE {
+            return basicRope(x, offset: offset ?? 0)
+        }
+        return x
+    }
+
+    /// Overload for batched generation with per-sequence offsets
+    private func applyRoPE(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        if let llama3Rope = rope as? Llama3RoPE {
+            return llama3Rope(x, offset: offset)
+        } else if let yarnRope = rope as? YarnRoPE {
+            return yarnRope(x, offset: offset)
+        } else if let basicRope = rope as? RoPE {
+            return basicRope(x, offset: offset)
+        }
+        return x
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -79,11 +102,11 @@ class Olmo3Attention: Module {
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = applyRoPE(queries, offset: cache.ropeOffset)
+            keys = applyRoPE(keys, offset: cache.ropeOffset)
         } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
+            queries = applyRoPE(queries, offset: nil)
+            keys = applyRoPE(keys, offset: nil)
         }
 
         let output = attentionWithCacheUpdate(
