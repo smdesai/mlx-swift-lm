@@ -68,14 +68,7 @@ public struct Batch {
         y = y[keepIndices]
 
         for c in cache {
-            if let batchCache = c as? BatchKVCache {
-                batchCache.filter(batchIndices: keepIndices)
-            } else if let batchRotatingCache = c as? BatchRotatingKVCache {
-                batchRotatingCache.filter(batchIndices: keepIndices)
-            } else if let arraysCache = c as? ArraysCache {
-                // Handle MambaCache and other ArraysCache-based caches for hybrid models
-                arraysCache.filter(batchIndices: keepIndices)
-            }
+            filterCacheEntry(c, batchIndices: keepIndices)
         }
     }
 
@@ -88,32 +81,66 @@ public struct Batch {
         maxTokens.append(contentsOf: other.maxTokens)
 
         for (c, o) in zip(cache, other.cache) {
-            if let batchCache = c as? BatchKVCache, let otherCache = o as? BatchKVCache {
-                batchCache.extend(otherCache)
-            } else if let batchRotatingCache = c as? BatchRotatingKVCache,
-                let otherCache = o as? BatchRotatingKVCache
-            {
-                batchRotatingCache.extend(otherCache)
-            } else if let arraysCache = c as? ArraysCache, let otherCache = o as? ArraysCache {
-                // Handle MambaCache and other ArraysCache-based caches for hybrid models
-                arraysCache.extend(other: otherCache)
-            }
+            extendCacheEntry(c, with: o)
         }
     }
 
     /// Extract cache for a single sequence
     public func extractCache(at index: Int) -> [KVCache] {
         cache.map { c in
-            if let batchCache = c as? BatchKVCache {
-                return batchCache.extract(at: index)
-            } else if let batchRotatingCache = c as? BatchRotatingKVCache {
-                return batchRotatingCache.extract(at: index)
-            }
-            // For MambaCache and other caches, return as-is
-            // (single-sequence extraction not implemented for ArraysCache)
-            return c
+            extractCacheEntry(c, at: index)
         }
     }
+}
+
+// MARK: - Cache Entry Helpers (CacheList-aware)
+
+/// Recursively filter a cache entry, handling CacheList by filtering each sub-cache
+private func filterCacheEntry(_ cache: KVCache, batchIndices: MLXArray) {
+    if let cacheList = cache as? CacheList {
+        for i in 0 ..< cacheList.count {
+            filterCacheEntry(cacheList[i], batchIndices: batchIndices)
+        }
+    } else if let batchCache = cache as? BatchKVCache {
+        batchCache.filter(batchIndices: batchIndices)
+    } else if let batchRotatingCache = cache as? BatchRotatingKVCache {
+        batchRotatingCache.filter(batchIndices: batchIndices)
+    } else if let arraysCache = cache as? ArraysCache {
+        arraysCache.filter(batchIndices: batchIndices)
+    }
+}
+
+/// Recursively extend a cache entry with another, handling CacheList by extending each sub-cache
+private func extendCacheEntry(_ cache: KVCache, with other: KVCache) {
+    if let cacheList = cache as? CacheList, let otherList = other as? CacheList {
+        for i in 0 ..< cacheList.count {
+            extendCacheEntry(cacheList[i], with: otherList[i])
+        }
+    } else if let batchCache = cache as? BatchKVCache, let otherCache = other as? BatchKVCache {
+        batchCache.extend(otherCache)
+    } else if let batchRotatingCache = cache as? BatchRotatingKVCache,
+        let otherCache = other as? BatchRotatingKVCache
+    {
+        batchRotatingCache.extend(otherCache)
+    } else if let arraysCache = cache as? ArraysCache, let otherCache = other as? ArraysCache {
+        arraysCache.extend(other: otherCache)
+    }
+}
+
+/// Recursively extract a single sequence's cache from a batch cache entry
+private func extractCacheEntry(_ cache: KVCache, at index: Int) -> KVCache {
+    if let cacheList = cache as? CacheList {
+        var extracted: [KVCache] = []
+        for i in 0 ..< cacheList.count {
+            extracted.append(extractCacheEntry(cacheList[i], at: index))
+        }
+        return CacheList(array: extracted)
+    } else if let batchCache = cache as? BatchKVCache {
+        return batchCache.extract(at: index)
+    } else if let batchRotatingCache = cache as? BatchRotatingKVCache {
+        return batchRotatingCache.extract(at: index)
+    }
+    return cache
 }
 
 // MARK: - Batch Generator
@@ -200,7 +227,7 @@ public class BatchGenerator {
     }
 
     private func cacheLength(_ cache: [KVCache]) -> Int {
-        cache.map { $0.offset }.max() ?? 0
+        maxCacheOffset(cache)
     }
 
     /// Remove prompts by UID
@@ -221,28 +248,43 @@ public class BatchGenerator {
         unprocessedPrompts.removeAll { uids.contains($0.uid) }
     }
 
+    private func makeBatchCacheEntry(
+        _ cache: KVCache, layerId: Int, leftPadding: [Int]
+    ) -> KVCache {
+        if cache is RotatingKVCache {
+            // Convert RotatingKVCache to BatchRotatingKVCache for batch attention
+            let rotating = cache as! RotatingKVCache
+            return BatchRotatingKVCache(
+                maxSize: rotating.maxSize ?? 4096, leftPadding: leftPadding)
+        } else if cache is MambaCache {
+            // CRITICAL: Preserve MambaCache for hybrid models (e.g., GraniteMoeHybrid)
+            // MambaCache stores conv state and SSM state, not attention keys/values.
+            // Converting to BatchKVCache breaks Mamba layers since they cast to MambaCache.
+            // ArraysCache (parent of MambaCache) already supports batching via filter/extend.
+            return MambaCache(leftPadding: leftPadding)
+        } else if let cacheList = cache as? CacheList {
+            // Handle hybrid models that wrap multiple cache types per layer (e.g., FalconH1)
+            // Create a CacheList where each sub-cache is the batch-aware version
+            var batchSubCaches: [KVCache] = []
+            for j in 0 ..< cacheList.count {
+                batchSubCaches.append(
+                    makeBatchCacheEntry(cacheList[j], layerId: layerId, leftPadding: leftPadding))
+            }
+            return CacheList(array: batchSubCaches)
+        } else {
+            // Convert KVCacheSimple and other attention caches to BatchKVCache
+            let batchCache = BatchKVCache(leftPadding: leftPadding)
+            batchCache.layerId = layerId
+            return batchCache
+        }
+    }
+
     private func makeBatchCache(leftPadding: [Int]) -> [KVCache] {
         // Create batch caches based on model's cache type
         let sampleCache = model.newCache(parameters: nil)
 
         return sampleCache.enumerated().map { (i, cache) -> KVCache in
-            if cache is RotatingKVCache {
-                // Convert RotatingKVCache to BatchRotatingKVCache for batch attention
-                let rotating = cache as! RotatingKVCache
-                return BatchRotatingKVCache(
-                    maxSize: rotating.maxSize ?? 4096, leftPadding: leftPadding)
-            } else if cache is MambaCache {
-                // CRITICAL: Preserve MambaCache for hybrid models (e.g., GraniteMoeHybrid)
-                // MambaCache stores conv state and SSM state, not attention keys/values.
-                // Converting to BatchKVCache breaks Mamba layers since they cast to MambaCache.
-                // ArraysCache (parent of MambaCache) already supports batching via filter/extend.
-                return MambaCache(leftPadding: leftPadding)
-            } else {
-                // Convert KVCacheSimple and other attention caches to BatchKVCache
-                let batchCache = BatchKVCache(leftPadding: leftPadding)
-                batchCache.layerId = i
-                return batchCache
-            }
+            makeBatchCacheEntry(cache, layerId: i, leftPadding: leftPadding)
         }
     }
 
@@ -287,12 +329,8 @@ public class BatchGenerator {
                 // CRITICAL FIX: Synchronize all cache offsets
                 // Some models (like Granite hybrid) have non-attention layers that don't update their cache.
                 // But mask creation uses cache?.first.offset, so we must sync all offsets.
-                let maxOffset = promptCache.map { $0.offset }.max() ?? 0
-                for cache in promptCache {
-                    if let batchCache = cache as? BatchKVCache, batchCache.offset != maxOffset {
-                        batchCache.offset = maxOffset
-                    }
-                }
+                let maxOffset = maxCacheOffset(promptCache)
+                syncCacheOffsets(promptCache, targetOffset: maxOffset)
 
                 eval(promptCache.flatMap { $0.innerState() })
 
@@ -374,25 +412,37 @@ public class BatchGenerator {
 
         return (0 ..< caches[0].count).map { i in
             let layerCaches = caches.map { $0[i] }
-
-            if layerCaches[0] is KVCacheSimple {
-                return BatchKVCache.merge(layerCaches.compactMap { $0 as? KVCacheSimple })
-            } else if let rotating = layerCaches[0] as? RotatingKVCache {
-                return BatchRotatingKVCache(maxSize: rotating.maxSize ?? 4096, leftPadding: [])
-            } else if layerCaches[0] is MambaCache {
-                // Merge MambaCache instances by concatenating states along batch dimension (axis 0)
-                let merged = MambaCache()
-                let mambaCaches = layerCaches.compactMap { $0 as? ArraysCache }
-                guard let first = mambaCaches.first else { return layerCaches[0] }
-                merged.state = first.state
-                for j in 1 ..< mambaCaches.count {
-                    merged.extend(other: mambaCaches[j])
-                }
-                return merged
-            }
-
-            return layerCaches[0]
+            return mergeCacheEntry(layerCaches)
         }
+    }
+
+    private func mergeCacheEntry(_ layerCaches: [KVCache]) -> KVCache {
+        if let firstList = layerCaches[0] as? CacheList {
+            // Recursively merge each sub-cache within the CacheList
+            let lists = layerCaches.compactMap { $0 as? CacheList }
+            var mergedSubCaches: [KVCache] = []
+            for j in 0 ..< firstList.count {
+                let subCaches = lists.map { $0[j] as KVCache }
+                mergedSubCaches.append(mergeCacheEntry(subCaches))
+            }
+            return CacheList(array: mergedSubCaches)
+        } else if layerCaches[0] is KVCacheSimple {
+            return BatchKVCache.merge(layerCaches.compactMap { $0 as? KVCacheSimple })
+        } else if let rotating = layerCaches[0] as? RotatingKVCache {
+            return BatchRotatingKVCache(maxSize: rotating.maxSize ?? 4096, leftPadding: [])
+        } else if layerCaches[0] is MambaCache {
+            // Merge MambaCache instances by concatenating states along batch dimension (axis 0)
+            let merged = MambaCache()
+            let mambaCaches = layerCaches.compactMap { $0 as? ArraysCache }
+            guard let first = mambaCaches.first else { return layerCaches[0] }
+            merged.state = first.state
+            for j in 1 ..< mambaCaches.count {
+                merged.extend(other: mambaCaches[j])
+            }
+            return merged
+        }
+
+        return layerCaches[0]
     }
 
     private func step(_ inputTokens: MLXArray, cache: [KVCache]) -> (MLXArray, MLXArray) {
@@ -401,18 +451,48 @@ public class BatchGenerator {
         // CRITICAL FIX: Synchronize all cache offsets after every model call
         // Hybrid models (like Granite) have non-attention layers that don't update their cache.
         // Mask creation uses cache?.first.offset, so we must sync all offsets.
-        let maxOffset = cache.map { $0.offset }.max() ?? 0
-        for c in cache {
-            if let batchCache = c as? BatchKVCache, batchCache.offset != maxOffset {
-                batchCache.offset = maxOffset
-            }
-        }
+        let maxOffset = maxCacheOffset(cache)
+        syncCacheOffsets(cache, targetOffset: maxOffset)
 
         let logits = result.logits[0..., -1, 0...]
         let logprobs = logits - logSumExp(logits, axis: -1, keepDims: true)
         let sampled = sampler.sample(logits: logprobs)
 
         return (sampled, logprobs)
+    }
+
+    /// Get the maximum offset across all caches, recursing into CacheList sub-caches
+    private func maxCacheOffset(_ caches: [KVCache]) -> Int {
+        var result = 0
+        for c in caches {
+            if let cacheList = c as? CacheList {
+                for i in 0 ..< cacheList.count {
+                    result = max(result, cacheList[i].offset)
+                }
+            } else {
+                result = max(result, c.offset)
+            }
+        }
+        return result
+    }
+
+    /// Recursively sync cache offsets, handling CacheList sub-caches
+    private func syncCacheOffsets(_ caches: [KVCache], targetOffset: Int) {
+        for c in caches {
+            if let cacheList = c as? CacheList {
+                for i in 0 ..< cacheList.count {
+                    syncCacheOffset(cacheList[i], targetOffset: targetOffset)
+                }
+            } else {
+                syncCacheOffset(c, targetOffset: targetOffset)
+            }
+        }
+    }
+
+    private func syncCacheOffset(_ cache: KVCache, targetOffset: Int) {
+        if let batchCache = cache as? BatchKVCache, batchCache.offset != targetOffset {
+            batchCache.offset = targetOffset
+        }
     }
 
     /// Generate next token for all active sequences

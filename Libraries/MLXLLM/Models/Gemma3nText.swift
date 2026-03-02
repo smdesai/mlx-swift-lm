@@ -483,11 +483,11 @@ class Gemma3nAltUp: Module {
         let activeX = predictions[config.altupActiveIdx]
         let innovation = activated - activeX
 
-        let allCoefsTransposed = allCoefs.transposed(2, 1, 0)
-        let corrected =
-            expandedDimensions(innovation, axis: 0)
-            * expandedDimensions(allCoefsTransposed, axis: 1)
-        let finalCorrected = corrected + predictions
+        // allCoefs: [B, L, altupNumInputs] → move altupNumInputs to front
+        // transposed(2, 0, 1) → [altupNumInputs, B, L], expand → [altupNumInputs, B, L, 1]
+        // This broadcasts correctly with innovation [B, L, hidden] and predictions [altupNumInputs, B, L, hidden]
+        let coefsPerStream = expandedDimensions(allCoefs.transposed(2, 0, 1), axis: -1)
+        let finalCorrected = coefsPerStream * innovation + predictions
 
         return finalCorrected.asType(activated.dtype)
     }
