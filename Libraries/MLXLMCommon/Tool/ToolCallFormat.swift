@@ -70,8 +70,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
 
-    /// XML function format used by Qwen3 Coder.
-    /// Example: `<function=name><parameter=key>value</parameter></function>`
+    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3.5, and similar models.
+    /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
 
     /// GLM4 format with arg_key/arg_value tags.
@@ -106,7 +106,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
-            return XMLFunctionParser()
+            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -143,6 +143,16 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Gemma
         if type == "gemma" {
             return .gemma
+        }
+
+        // Nemotron family (nemotron_h, etc.)
+        if type.hasPrefix("nemotron") {
+            return .xmlFunction
+        }
+
+        // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
+        if type.hasPrefix("qwen3_5") {
+            return .xmlFunction
         }
 
         // Mistral3 family (mistral3, mistral3_text, etc.)

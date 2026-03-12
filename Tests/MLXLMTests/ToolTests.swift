@@ -213,7 +213,7 @@ struct ToolTests {
 
     @Test("Test XML Function Parser - Qwen3 Coder Format")
     func testXMLFunctionParser() throws {
-        let parser = XMLFunctionParser()
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         let content =
             "<function=get_weather><parameter=location>Tokyo</parameter><parameter=unit>celsius</parameter></function>"
 
@@ -226,7 +226,7 @@ struct ToolTests {
 
     @Test("Test XML Function Parser - With Type Conversion")
     func testXMLFunctionParserTypeConversion() throws {
-        let parser = XMLFunctionParser()
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         let tools: [[String: any Sendable]] = [
             [
                 "function": [
@@ -252,7 +252,7 @@ struct ToolTests {
 
     @Test("Test XML Function Parser - Multiline Content (Qwen3.5 style)")
     func testXMLFunctionParserMultiline() throws {
-        let parser = XMLFunctionParser()
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         // Qwen3.5 models generate newlines between the XML tags
         let content = """
             <tool_call>
@@ -269,7 +269,7 @@ struct ToolTests {
 
     @Test("Test XML Function Parser - Multiline Parameters")
     func testXMLFunctionParserMultilineParams() throws {
-        let parser = XMLFunctionParser()
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         let content = """
             <function=get_weather>
             <parameter=location>
@@ -282,6 +282,63 @@ struct ToolTests {
 
         #expect(toolCall.function.name == "get_weather")
         #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper)
+
+    @Test("Test Qwen3.5 XML Function Parser - With tool_call Tags")
+    func testQwen35Parser() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = """
+            <tool_call>
+            <function=get_weather>
+            <parameter=location>
+            San Francisco
+            </parameter>
+            <parameter=unit>
+            celsius
+            </parameter>
+            </function>
+            </tool_call>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("San Francisco"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Qwen3.5 Format via ToolCallProcessor")
+    func testQwen35FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let chunks: [String] = [
+            "<tool", "_call>", "\n<function=get_weather>\n",
+            "<parameter=location>\nTokyo\n</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+
+        for chunk in chunks {
+            _ = processor.processChunk(chunk)
+        }
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Test Qwen3.5 Format - No Arguments")
+    func testQwen35FormatNoArgs() throws {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let content = "<tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_current_datetime")
+        #expect(toolCall.function.arguments.isEmpty)
     }
 
     // MARK: - GLM4 Format Tests
@@ -452,6 +509,15 @@ struct ToolTests {
         // Gemma models
         #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
         #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
+
+        // Nemotron models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .xmlFunction)
+
+        // Qwen3.5 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .xmlFunction)
 
         // Mistral3 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
