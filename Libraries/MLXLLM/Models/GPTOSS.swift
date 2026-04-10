@@ -5,6 +5,8 @@
 //  Created by John Mai on 2025/8/6.
 //
 
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gpt_oss.py
+
 import Foundation
 import MLX
 import MLXLMCommon
@@ -227,13 +229,8 @@ class AttentionBlock: Module {
             if sinksActive {
                 fatalError("Quantized attention does not support non-zero sinks.")
             }
-            if qcache.offset == 0 {
-                q = rope(q)
-                k = rope(k)
-            } else {
-                q = rope(q, offset: qcache.offset)
-                k = rope(k, offset: qcache.offset)
-            }
+            q = applyRotaryPosition(rope, to: q, cache: cache)
+            k = applyRotaryPosition(rope, to: k, cache: cache)
 
             let (qKeys, qValues) = qcache.updateQuantized(keys: k, values: v)
             let vHat = quantizedScaledDotProductAttention(
@@ -250,13 +247,11 @@ class AttentionBlock: Module {
             return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
         }
 
+        q = applyRotaryPosition(rope, to: q, cache: cache)
+        k = applyRotaryPosition(rope, to: k, cache: cache)
+
         if let cache {
-            q = rope(q, offset: cache.ropeOffset)
-            k = rope(k, offset: cache.ropeOffset)
             (k, v) = cache.update(keys: k, values: v)
-        } else {
-            q = rope(q)
-            k = rope(k)
         }
 
         let vHat = MLXFast.scaledDotProductAttention(
@@ -381,6 +376,7 @@ public class GPTOSSModelInner: Module {
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
+        let seqLen = x.dim(1)
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
         var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
 
@@ -390,8 +386,8 @@ public class GPTOSSModelInner: Module {
                 maskMode = mask
             } else if layerTypes[i] == "full_attention" {
                 if fullMask == nil {
-                    fullMask = createAttentionMask(
-                        h: x,
+                    fullMask = makeAttentionMask(
+                        n: seqLen,
                         cache: cache[fullAttentionIndex],
                         windowSize: nil
                     )
@@ -399,8 +395,8 @@ public class GPTOSSModelInner: Module {
                 maskMode = fullMask!
             } else {
                 if slidingMask == nil {
-                    slidingMask = createAttentionMask(
-                        h: x,
+                    slidingMask = makeAttentionMask(
+                        n: seqLen,
                         cache: cache[slidingAttentionIndex],
                         windowSize: windowSize
                     )

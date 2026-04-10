@@ -2,6 +2,7 @@
 
 import ArgumentParser
 import Foundation
+import Hub
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -84,7 +85,7 @@ struct BatchGenerate: AsyncParsableCommand {
             .filter { !$0.isEmpty }
 
         guard !prompts.isEmpty else {
-            print("Error: no prompts provided", to: &standardError)
+            printErr("Error: no prompts provided")
             throw ExitCode.failure
         }
 
@@ -96,7 +97,11 @@ struct BatchGenerate: AsyncParsableCommand {
 
         // Load model
         printErr("Loading model: \(modelId)")
-        let context = try await loadModel(id: modelId) { progress in
+        let context = try await loadModel(
+            from: HubDownloader(),
+            using: HFTokenizerLoader(),
+            id: modelId
+        ) { progress in
             let pct = Int(progress.fractionCompleted * 100)
             printErr("\rDownloading model... \(pct)%", terminator: "")
         }
@@ -206,7 +211,7 @@ struct BatchGenerate: AsyncParsableCommand {
         if let systemPrompt, !systemPrompt.isEmpty, !hasHybridCaches, !hasRotatingCaches {
             do {
                 // A) Tokenize system-only message (no generation prompt suffix)
-                var systemOnlyContext: [String: Any] = ["add_generation_prompt": false]
+                var systemOnlyContext: [String: any Sendable] = ["add_generation_prompt": false]
                 if let ctx = thinkingContext {
                     for (key, value) in ctx { systemOnlyContext[key] = value }
                 }
@@ -321,7 +326,7 @@ struct BatchGenerate: AsyncParsableCommand {
         }
 
         // Print results
-        let texts = uids.map { context.tokenizer.decode(tokens: results[$0]!) }
+        let texts = uids.map { context.tokenizer.decode(tokenIds: results[$0]!) }
         for (i, text) in texts.enumerated() {
             print("")
             print("--- Prompt \(i + 1): \(prompts[i]) ---")
@@ -342,18 +347,84 @@ struct BatchGenerate: AsyncParsableCommand {
     }
 }
 
+// MARK: - HuggingFace Bridge
+
+private struct HubDownloader: MLXLMCommon.Downloader {
+    private let hubApi = HubApi()
+
+    func download(
+        id: String,
+        revision: String?,
+        matching patterns: [String],
+        useLatest: Bool,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> URL {
+        try await hubApi.snapshot(
+            from: id,
+            revision: revision ?? "main",
+            matching: patterns,
+            progressHandler: progressHandler
+        )
+    }
+}
+
+private struct HFTokenizerLoader: MLXLMCommon.TokenizerLoader {
+    func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        let upstream = try await AutoTokenizer.from(modelFolder: directory, strict: false)
+        return TokenizerBridge(upstream)
+    }
+}
+
+private struct TokenizerBridge: MLXLMCommon.Tokenizer {
+    private let upstream: any Tokenizers.Tokenizer
+
+    init(_ upstream: any Tokenizers.Tokenizer) {
+        self.upstream = upstream
+    }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+    }
+
+    func convertTokenToId(_ token: String) -> Int? {
+        upstream.convertTokenToId(token)
+    }
+
+    func convertIdToToken(_ id: Int) -> String? {
+        upstream.convertIdToToken(id)
+    }
+
+    var bosToken: String? { upstream.bosToken }
+    var eosToken: String? { upstream.eosToken }
+    var unknownToken: String? { upstream.unknownToken }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        do {
+            return try upstream.applyChatTemplate(
+                messages: messages, tools: tools, additionalContext: additionalContext)
+        } catch Tokenizers.TokenizerError.missingChatTemplate {
+            throw MLXLMCommon.TokenizerError.missingChatTemplate
+        }
+    }
+}
+
 // MARK: - Stderr Helpers
 
-private var standardError = FileHandle.standardError
-
-extension FileHandle: @retroactive TextOutputStream {
-    public func write(_ string: String) {
-        let data = Data(string.utf8)
-        self.write(data)
+private struct StderrOutputStream: TextOutputStream {
+    mutating func write(_ string: String) {
+        FileHandle.standardError.write(Data(string.utf8))
     }
 }
 
 private func printErr(_ message: String, terminator: String = "\n") {
-    var stderr = standardError
+    var stderr = StderrOutputStream()
     print(message, terminator: terminator, to: &stderr)
 }

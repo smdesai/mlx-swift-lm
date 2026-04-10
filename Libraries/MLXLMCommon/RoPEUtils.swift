@@ -13,7 +13,7 @@ public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
     let maxPositionEmbeddings: Int
     let traditional: Bool
-    let freqs: MLXArray
+    let _freqs: MLXArray
 
     init(
         dims: Int,
@@ -57,7 +57,7 @@ public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
             (oldContextLen / wavelens - lowFreqFactor) / (highFreqFactor - lowFreqFactor)
         let smoothFreqs = frequencies / ((1 - smoothFactors) / factor + smoothFactors)
 
-        self.freqs = MLX.where(isMediumFreq, smoothFreqs, frequencies)
+        self._freqs = MLX.where(isMediumFreq, smoothFreqs, frequencies)
         super.init()
     }
 
@@ -69,11 +69,10 @@ public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
             base: nil,
             scale: 1.0,
             offset: offset,
-            freqs: freqs
+            freqs: _freqs
         )
     }
 
-    /// Overload for batched generation with per-sequence offsets
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         MLXFast.RoPE(
             x,
@@ -82,22 +81,15 @@ public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
             base: nil,
             scale: 1.0,
             offset: offset,
-            freqs: freqs
+            freqs: _freqs
         )
     }
+
 }
 
 public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dimensions: Int
     let traditional: Bool
-    let maxPositionEmbeddings: Int
-    let base: Float
-    let scalingFactor: Float
-    let originalMaxPositionEmbeddings: Int
-    let betaFast: Float
-    let betaSlow: Float
-    let mscale: Float
-    let mscaleAllDim: Float
 
     private let _mscale: Float
     private let _freqs: MLXArray
@@ -118,14 +110,6 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
 
         self.dimensions = dimensions
         self.traditional = traditional
-        self.maxPositionEmbeddings = maxPositionEmbeddings
-        self.base = base
-        self.scalingFactor = scalingFactor
-        self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
-        self.betaFast = betaFast
-        self.betaSlow = betaSlow
-        self.mscale = mscale
-        self.mscaleAllDim = mscaleAllDim
 
         func yarnFindCorrectionDim(numRotations: Float) -> Float {
             return Float(dimensions)
@@ -179,8 +163,13 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        // "copy" of x as we are going to write through it and don't want to update
+        // through the reference
+        // https://github.com/ml-explore/mlx-swift/issues/364
+        var x = x
         if _mscale != 1.0 {
-            x[.ellipsis, 0 ..< dimensions] = _mscale * x[.ellipsis, 0 ..< dimensions]
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
         }
 
         return MLXFast.RoPE(
@@ -194,10 +183,11 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         )
     }
 
-    /// Overload for batched generation with per-sequence offsets
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        var x = x
         if _mscale != 1.0 {
-            x[.ellipsis, 0 ..< dimensions] = _mscale * x[.ellipsis, 0 ..< dimensions]
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
         }
 
         return MLXFast.RoPE(
@@ -210,7 +200,12 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             freqs: self._freqs
         )
     }
+
 }
+
+private let yarnTypes: Set = ["yarn", "deepseek_yarn", "telechat3-yarn"]
+
+public typealias RoPELayer = OffsetLayer & ArrayOffsetLayer
 
 public func initializeRope(
     dims: Int,
@@ -218,7 +213,7 @@ public func initializeRope(
     traditional: Bool,
     scalingConfig: [String: StringOrNumber]?,
     maxPositionEmbeddings: Int?
-) -> OffsetLayer & ArrayOffsetLayer {
+) -> RoPELayer {
     let ropeType: String = {
         if let config = scalingConfig,
             let typeValue = config["type"] ?? config["rope_type"],
@@ -245,7 +240,7 @@ public func initializeRope(
             base: base,
             scalingConfig: scalingConfig
         )
-    } else if ropeType == "yarn" {
+    } else if yarnTypes.contains(ropeType) {
         let factor = scalingConfig?["factor"]?.asFloat() ?? 32.0
         let origMax = scalingConfig?["original_max_position_embeddings"]?.asInt() ?? 4096
         let betaFast = scalingConfig?["beta_fast"]?.asFloat() ?? 32.0

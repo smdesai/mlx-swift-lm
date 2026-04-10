@@ -2,7 +2,8 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
+
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/apertus.py
 
 // MARK: - Configuration
 
@@ -152,101 +153,6 @@ private class XIELU: Module, UnaryLayer {
     }
 }
 
-private class DynamicNTKScalingRoPE: Module {
-    let dims: Int
-    let maxPositionEmbeddings: Int
-    let traditional: Bool
-    var base: Float?
-    let scale: Float
-    let ropeType: String
-    let ropeScaling: [String: StringOrNumber]?
-    var freqs: MLXArray?
-
-    init(
-        dims: Int,
-        maxPositionEmbeddings: Int?,
-        traditional: Bool = false,
-        base: Float = 10000,
-        scale: Float = 1.0,
-        ropeType: String = "default",
-        ropeScaling: [String: StringOrNumber]? = nil
-    ) {
-        self.dims = dims
-        self.maxPositionEmbeddings = maxPositionEmbeddings ?? 2048
-        self.traditional = traditional
-        self.base = base
-        self.scale = scale
-        self.ropeType = ropeType
-        self.ropeScaling = ropeScaling
-        super.init()
-        computeFreqs()
-    }
-
-    private func computeFreqs() {
-        if ropeType != "llama3" {
-            freqs = nil
-            return
-        }
-
-        guard let ropeScaling = ropeScaling,
-            case .float(let factor) = ropeScaling["factor"],
-            case .float(let lowFreqFactor) = ropeScaling["low_freq_factor"] ?? .float(1.0),
-            case .float(let highFreqFactor) = ropeScaling["high_freq_factor"] ?? .float(4.0),
-            case .float(let oldContextLen) = ropeScaling["original_max_position_embeddings"]
-                ?? .float(8192),
-            let base
-        else {
-            freqs = nil
-            return
-        }
-
-        let lowFreqWavelen = oldContextLen / lowFreqFactor
-        let highFreqWavelen = oldContextLen / highFreqFactor
-
-        let indices = MLXArray(stride(from: 0, to: dims, by: 2))
-        var frequencies = MLX.pow(base, indices / Float(dims))
-        let wavelens = 2 * Float.pi * frequencies
-
-        frequencies = MLX.where(
-            wavelens .> MLXArray(lowFreqWavelen), frequencies * factor, frequencies)
-        let isMediumFreq = MLX.logicalAnd(
-            wavelens .> MLXArray(highFreqWavelen),
-            wavelens .< MLXArray(lowFreqWavelen)
-        )
-        let smoothFactors =
-            (oldContextLen / wavelens - lowFreqFactor) / (highFreqFactor - lowFreqFactor)
-        let smoothFreqs = frequencies / ((1 - smoothFactors) / factor + smoothFactors)
-
-        freqs = MLX.where(isMediumFreq, smoothFreqs, frequencies)
-        self.base = nil
-    }
-
-    func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
-        MLXFast.RoPE(
-            x,
-            dimensions: dims,
-            traditional: traditional,
-            base: base,
-            scale: scale,
-            offset: offset,
-            freqs: freqs
-        )
-    }
-
-    /// Overload for batched generation with per-sequence offsets
-    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
-        MLXFast.RoPE(
-            x,
-            dimensions: dims,
-            traditional: traditional,
-            base: base,
-            scale: scale,
-            offset: offset,
-            freqs: freqs
-        )
-    }
-}
-
 private class ApertusAttention: Module {
     let args: ApertusConfiguration
     let scale: Float
@@ -260,7 +166,7 @@ private class ApertusAttention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rope: DynamicNTKScalingRoPE
+    let rope: RoPELayer
 
     init(args: ApertusConfiguration) {
         self.args = args
@@ -280,20 +186,11 @@ private class ApertusAttention: Module {
         self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
         self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
-        self.rope = DynamicNTKScalingRoPE(
-            dims: headDim,
-            maxPositionEmbeddings: args.maxPositionEmbeddings,
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
             traditional: args.ropeTraditional,
-            base: args.ropeTheta,
-            scale: 1.0,
-            ropeType: {
-                if case .string(let value) = args.ropeScaling?["type"] {
-                    return value
-                } else {
-                    return "default"
-                }
-            }(),
-            ropeScaling: args.ropeScaling)
+            scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     func callAsFunction(
@@ -326,17 +223,14 @@ private class ApertusAttention: Module {
         values = values.transposed(0, 2, 1, 3)
 
         // 4. RoPE
-        if let cache = cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
+        if let cache = cache {
             // Update cache (expects [B, H, L, D])
             let (k, v) = cache.update(keys: keys, values: values)
             keys = k
             values = v
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
         }
 
         // 5. Attention (SDPA expects [B, H, L, D])
@@ -424,7 +318,7 @@ private class ApertusModelInner: Module {
     ) -> MLXArray {
         var h = embedTokens(inputs)
 
-        let mask = createAttentionMask(h: inputs, cache: cache)
+        let mask = createAttentionMask(h: inputs, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])

@@ -1,10 +1,8 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
-import Hub
 import MLX
 import MLXLMCommon
-import Tokenizers
 
 public enum VLMError: LocalizedError, Equatable {
     case imageRequired
@@ -56,7 +54,7 @@ private func create<C: Codable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
 ) -> (Data) throws -> M {
     { data in
-        let configuration = try JSONDecoder().decode(C.self, from: data)
+        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return modelInit(configuration)
     }
 }
@@ -70,14 +68,14 @@ private func create<C: Codable, P>(
         ) -> P
 ) -> (Data, any Tokenizer) throws -> P {
     { data, tokenizer in
-        let configuration = try JSONDecoder().decode(C.self, from: data)
+        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return processorInit(configuration, tokenizer)
     }
 }
 
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
-/// Typically called via ``LLMModelFactory/load(hub:configuration:progressHandler:)``.
+/// Typically called via ``VLMModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
 public enum VLMTypeRegistry {
 
     /// Shared instance with default model types.
@@ -86,6 +84,8 @@ public enum VLMTypeRegistry {
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
+        "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
@@ -216,6 +216,16 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Describe this image in detail."
     )
 
+    static public let qwen3_5_27B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-27B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let qwen3_5_35B_A3B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-35B-A3B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -272,12 +282,10 @@ public final class VLMModelFactory: ModelFactory {
     public let modelRegistry: AbstractModelRegistry
 
     public func _load(
-        hub: HubApi, configuration: ModelConfiguration,
-        progressHandler: @Sendable @escaping (Progress) -> Void
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
-        // download weights and config
-        let modelDirectory = try await downloadModel(
-            hub: hub, configuration: configuration, progressHandler: progressHandler)
+        let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")
@@ -290,7 +298,7 @@ public final class VLMModelFactory: ModelFactory {
         }
         let baseConfig: BaseConfiguration
         do {
-            baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
+            baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -309,22 +317,28 @@ public final class VLMModelFactory: ModelFactory {
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         if let generationData = try? Data(contentsOf: generationConfigURL),
-            let generationConfig = try? JSONDecoder().decode(
+            let generationConfig = try? JSONDecoder.json5().decode(
                 GenerationConfigFile.self, from: generationData),
             let genEosIds = generationConfig.eosTokenIds?.values
         {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
-        // Create mutable configuration with loaded EOS token IDs
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
 
-        // Load tokenizer, processor config, and weights in parallel using async let.
+        // Auto-detect tool call format from model type if not explicitly set
+        if mutableConfiguration.toolCallFormat == nil {
+            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+        }
+
+        // Load tokenizer from model directory (or alternate tokenizer repo),
+        // processor config, and weights in parallel using async let.
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
         // parallel scheduling. This may briefly block a cooperative thread pool thread,
         // but the config file is small and model loading is not a high-concurrency path.
-        async let tokenizerTask = loadTokenizer(configuration: configuration, hub: hub)
+        async let tokenizerTask = tokenizerLoader.load(
+            from: configuration.tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
         try loadWeights(
@@ -358,8 +372,21 @@ public final class VLMModelFactory: ModelFactory {
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
 
+        // Build a ModelConfiguration for the ModelContext
+        let tokenizerSource: TokenizerSource? =
+            configuration.tokenizerDirectory == modelDirectory
+            ? nil
+            : .directory(configuration.tokenizerDirectory)
+        let modelConfig = ModelConfiguration(
+            directory: modelDirectory,
+            tokenizerSource: tokenizerSource,
+            defaultPrompt: configuration.defaultPrompt,
+            extraEOSTokens: mutableConfiguration.extraEOSTokens,
+            eosTokenIds: mutableConfiguration.eosTokenIds,
+            toolCallFormat: mutableConfiguration.toolCallFormat)
+
         return .init(
-            configuration: mutableConfiguration, model: model, processor: processor,
+            configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
     }
 
@@ -385,7 +412,7 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
         : processorConfigURL
     do {
         let data = try Data(contentsOf: url)
-        let config = try JSONDecoder().decode(BaseProcessorConfiguration.self, from: data)
+        let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)

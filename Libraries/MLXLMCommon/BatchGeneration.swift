@@ -689,7 +689,7 @@ public func batchGenerate(
     }
 
     // Return results in order
-    let texts = uids.map { tokenizer.decode(tokens: results[$0]!) }
+    let texts = uids.map { tokenizer.decode(tokenIds: results[$0]!) }
     let stats = generator.statistics()
     let orderedCaches = returnPromptCaches ? uids.map { caches[$0]! } : nil
 

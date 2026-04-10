@@ -9,7 +9,6 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/bitnet.py
 
@@ -276,7 +275,7 @@ class BitnetAttention: Module {
 
     @ModuleInfo(key: "attn_sub_norm") var attnSubNorm: RMSNorm
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     init(_ args: BitnetConfiguration) {
         self.args = args
@@ -295,23 +294,10 @@ class BitnetAttention: Module {
 
         _attnSubNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
-                fatalError("ropeScaling.factor must be a float")
-            }
-        } else {
-            ropeScale = 1
-        }
-
-        rope = RoPE(
-            dimensions: headDim, traditional: args.ropeTraditional, base: args.ropeTheta,
-            scale: ropeScale
-        )
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
+            traditional: args.ropeTraditional, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     func callAsFunction(
@@ -329,13 +315,11 @@ class BitnetAttention: Module {
         keys = keys.reshaped(B, L, args.resolvedKvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.resolvedKvHeads, -1).transposed(0, 2, 1, 3)
 
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+
         if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
             (keys, values) = cache.update(keys: keys, values: values)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
         }
 
         let output = MLXFast.scaledDotProductAttention(

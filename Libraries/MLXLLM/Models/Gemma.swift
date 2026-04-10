@@ -4,9 +4,8 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
-// Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/gemma.py
+// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma.py
 
 // Specialized norm for Gemma
 class GemmaRMSNorm: Module, UnaryLayer {
@@ -69,13 +68,8 @@ class GemmaAttention: Module {
         keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

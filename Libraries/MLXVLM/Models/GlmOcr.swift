@@ -9,11 +9,9 @@
 
 import CoreImage
 import Foundation
-import Hub
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
 // MARK: - Language
 
@@ -76,12 +74,20 @@ private enum Language {
     // MARK: M-RoPE Rotary Embedding
 
     fileprivate class GlmOcrRotaryEmbedding {
-        let mropeSection: [Int]
+        let mropeSplitIndices: [Int]
         let invFreq: MLXArray
         let attentionScaling: Float
 
         init(_ config: GlmOcrConfiguration.TextConfiguration) {
-            self.mropeSection = config.ropeParameters.mropeSection
+            // Pre-compute cumulative split indices from mropeSection (config-derived, never changes)
+            var indices = [Int]()
+            var cumsum = 0
+            for s in config.ropeParameters.mropeSection.dropLast() {
+                cumsum += s
+                indices.append(cumsum)
+            }
+            self.mropeSplitIndices = indices
+
             let dim = Int(Float(config.headDim) * config.ropeParameters.partialRotaryFactor)
             let base = config.ropeParameters.ropeTheta
             self.attentionScaling = 1.0
@@ -94,16 +100,7 @@ private enum Language {
 
         /// Apply M-RoPE: select different frequency dimensions for T, H, W.
         func applyMrope(_ freqs: MLXArray) -> MLXArray {
-            // freqs: (3, batch, seq, dim/2)
-            // mropeSection: [16, 24, 24] -> cumsum split indices [16, 40]
-            var splitIndices = [Int]()
-            var cumsum = 0
-            for s in mropeSection.dropLast() {
-                cumsum += s
-                splitIndices.append(cumsum)
-            }
-
-            let chunks = split(freqs, indices: splitIndices, axis: -1)
+            let chunks = split(freqs, indices: mropeSplitIndices, axis: -1)
             // Select chunk[i % 3] from the temporal dimension (axis 0)
             let selected = chunks.enumerated().map { i, chunk in
                 chunk[i % 3]
@@ -896,7 +893,6 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
         let seqLength = inputIds.dim(1)
         let spatialMergeSize = config.visionConfiguration.spatialMergeSize
         let imageTokenId = config.baseConfiguration.imageTokenId
-        let imageStartTokenId = config.baseConfiguration.imageStartTokenId
 
         guard let imageGridThw, !imageGridThw.isEmpty else {
             // Text only: sequential positions tiled 3x
@@ -909,9 +905,10 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         // Build position_ids per batch element using 3 separate dimension arrays
-        let positionIds = ones([3, batchSize, seqLength], type: Int32.self)
+        precondition(batchSize == 1, "GlmOcr getRopeIndex only supports batchSize == 1")
+        let positionIds = zeros([3, batchSize, seqLength], type: Int32.self)
         var imageIndex = 0
-        var mropePositionDeltas = [Int]()
+        var mropePositionDelta: Int = 0
 
         for batchIdx in 0 ..< batchSize {
             let inputTokens: [Int32] = inputIds[batchIdx].asArray(Int32.self)
@@ -920,25 +917,30 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             var dimT = [Int32]()
             var dimH = [Int32]()
             var dimW = [Int32]()
+            dimT.reserveCapacity(seqLength)
+            dimH.reserveCapacity(seqLength)
+            dimW.reserveCapacity(seqLength)
             var st = 0
             var lastMax: Int32 = -1
 
-            // Find image start tokens to count images
-            var imageCount = 0
-            for (idx, tok) in inputTokens.enumerated() {
-                if tok == Int32(imageStartTokenId)
-                    && idx + 1 < inputTokens.count
-                    && inputTokens[idx + 1] == Int32(imageTokenId)
-                {
-                    imageCount += 1
+            // Append sequential text positions to all 3 dimensions
+            let appendTextPositions = { (count: Int) in
+                guard count > 0 else { return }
+                let base: Int32 = lastMax + 1
+                for j in 0 ..< count {
+                    let pos = base + Int32(j)
+                    dimT.append(pos)
+                    dimH.append(pos)
+                    dimW.append(pos)
                 }
+                lastMax = base + Int32(count) - 1
             }
 
-            for _ in 0 ..< imageCount {
-                guard let edImage = inputTokens[st...].firstIndex(of: Int32(imageTokenId)) else {
+            // Process images: find each image token and build 3D positions
+            while imageIndex < imageGridThw.count {
+                guard let ed = inputTokens[st...].firstIndex(of: Int32(imageTokenId)) else {
                     break
                 }
-                let ed = edImage
 
                 let frame = imageGridThw[imageIndex]
                 let llmGridT = frame.t
@@ -946,21 +948,10 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
                 let llmGridW = frame.w / spatialMergeSize
                 imageIndex += 1
 
-                // Text before this image: all 3 dims get same sequential positions
-                let textLen = ed - st
-                let stIdx: Int32 = lastMax + 1
+                // Text before this image
+                appendTextPositions(ed - st)
 
-                if textLen > 0 {
-                    for j in 0 ..< textLen {
-                        let pos = stIdx + Int32(j)
-                        dimT.append(pos)
-                        dimH.append(pos)
-                        dimW.append(pos)
-                    }
-                    lastMax = stIdx + Int32(textLen) - 1
-                }
-
-                // Image tokens: 3D spatial positions offset by textLen + stIdx
+                // Image tokens: 3D spatial positions
                 let imgOffset: Int32 = lastMax + 1
                 for t in 0 ..< llmGridT {
                     for h in 0 ..< llmGridH {
@@ -971,7 +962,6 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
                         }
                     }
                 }
-                // Update lastMax from the image positions
                 let tMax = Int32(llmGridT - 1) + imgOffset
                 let hMax = Int32(llmGridH - 1) + imgOffset
                 let wMax = Int32(llmGridW - 1) + imgOffset
@@ -981,30 +971,16 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             }
 
             // Remaining text after last image
-            if st < inputTokens.count {
-                let stIdx: Int32 = lastMax + 1
-                let textLen = inputTokens.count - st
-                for j in 0 ..< textLen {
-                    let pos = stIdx + Int32(j)
-                    dimT.append(pos)
-                    dimH.append(pos)
-                    dimW.append(pos)
-                }
-                lastMax = stIdx + Int32(textLen) - 1
-            }
+            appendTextPositions(inputTokens.count - st)
 
-            // Set position_ids for this batch element
-            let tArray = MLXArray(dimT)
-            let hArray = MLXArray(dimH)
-            let wArray = MLXArray(dimW)
-            positionIds[0, batchIdx] = tArray
-            positionIds[1, batchIdx] = hArray
-            positionIds[2, batchIdx] = wArray
+            positionIds[0, batchIdx] = MLXArray(dimT)
+            positionIds[1, batchIdx] = MLXArray(dimH)
+            positionIds[2, batchIdx] = MLXArray(dimW)
 
-            mropePositionDeltas.append(Int(lastMax) + 1 - inputTokens.count)
+            mropePositionDelta = Int(lastMax) + 1 - inputTokens.count
         }
 
-        let deltas = MLXArray(Int32(mropePositionDeltas[0]))
+        let deltas = MLXArray(Int32(mropePositionDelta))
         return (positionIds, deltas)
     }
 
@@ -1088,8 +1064,9 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
                 k = k.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
             }
 
-            // Skip nextn predict layers (layer 16)
-            if k.contains("layers.16") {
+            // The checkpoint includes a "next-n" prediction head at the layer index
+            // equal to hiddenLayers (one past the last real decoder layer). Skip it.
+            if k.contains("layers.\(config.textConfiguration.hiddenLayers).") {
                 continue
             }
 

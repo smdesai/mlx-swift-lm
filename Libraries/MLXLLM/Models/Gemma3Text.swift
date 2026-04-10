@@ -5,7 +5,7 @@
 //  Created by Anthony DePasquale on 14.03.2025.
 //
 
-// Based on https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/gemma3_text.py
+// Based on https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma3_text.py
 
 import Foundation
 import MLX
@@ -140,7 +140,7 @@ class Gemma3Attention: Module {
     @ModuleInfo(key: "q_norm") var queryNorm: Gemma.RMSNorm
     @ModuleInfo(key: "k_norm") var keyNorm: Gemma.RMSNorm
 
-    @ModuleInfo var rope: OffsetLayer
+    @ModuleInfo var rope: RoPELayer
 
     init(_ config: Gemma3TextConfiguration, layerIdx: Int) {
         let dim = config.hiddenSize
@@ -197,9 +197,8 @@ class Gemma3Attention: Module {
         queries = queryNorm(queries)
         keys = keyNorm(keys)
 
-        let offset = cache?.offset ?? 0
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

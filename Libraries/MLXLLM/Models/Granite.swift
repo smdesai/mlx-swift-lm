@@ -21,7 +21,7 @@ class GraniteAttention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     public init(_ args: GraniteConfiguration) {
         self.args = args
@@ -39,19 +39,10 @@ class GraniteAttention: Module {
         self._wv.wrappedValue = Linear(dim, nKvHeads * headDim, bias: attentionBias)
         self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: attentionBias)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
-                fatalError("ropeScaling.factor must be a float")
-            }
-        } else {
-            ropeScale = 1
-        }
-        rope = RoPE(dimensions: headDim, traditional: false, base: args.ropeTheta, scale: ropeScale)
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
+            traditional: false, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     public func callAsFunction(
@@ -68,13 +59,8 @@ class GraniteAttention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

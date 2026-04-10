@@ -264,7 +264,7 @@ class FalconH1Attention: Module {
     @ModuleInfo(key: "v_proj") var vProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     init(_ args: FalconH1Configuration) {
         self.hiddenSize = args.hiddenSize
@@ -278,19 +278,17 @@ class FalconH1Attention: Module {
         _vProj.wrappedValue = Linear(hiddenSize, numKVHeads * headDim, bias: args.attentionBias)
         _oProj.wrappedValue = Linear(numHeads * headDim, hiddenSize, bias: args.attentionBias)
 
-        let ropeScale: Float =
+        let scalingConfig: [String: StringOrNumber]? =
             if let ropeScaling = args.ropeScaling {
-                1 / ropeScaling
+                ["type": .string("linear"), "factor": .float(ropeScaling)]
             } else {
-                1
+                nil
             }
 
-        self.rope = RoPE(
-            dimensions: headDim,
-            traditional: args.ropeTraditional,
-            base: args.ropeTheta,
-            scale: ropeScale
-        )
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
+            traditional: args.ropeTraditional, scalingConfig: scalingConfig,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     func callAsFunction(_ x: MLXArray, mask: MLXArray? = nil, cache: KVCache? = nil) -> MLXArray {
@@ -304,18 +302,11 @@ class FalconH1Attention: Module {
         keys = keys.reshaped(B, L, numKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, numKVHeads, -1).transposed(0, 2, 1, 3)
 
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+
         if let cache {
-            if cache.useArrayOffset {
-                queries = rope(queries, offset: cache.ropeOffset)
-                keys = rope(keys, offset: cache.ropeOffset)
-            } else {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
-            }
             (keys, values) = cache.update(keys: keys, values: values)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
         }
 
         var output = MLXFast.scaledDotProductAttention(
@@ -619,18 +610,13 @@ private func createSSMMask(h: MLXArray, cache: ArraysCache?) -> MLXArray? {
 
 private func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
     let N = h.dim(1)
+    // If cache exists and can make masks, use it
+    // Otherwise for single token, no mask needed
+    // For multi-token, SDPA will handle causal mask internally when nil
     if N == 1 {
         return nil
     }
-    // Must create an explicit causal mask for multi-token prefill.
-    // MLX's scaledDotProductAttention does NOT auto-apply causal masking
-    // when mask is nil — it performs bidirectional attention, which corrupts
-    // autoregressive model outputs (especially for longer sequences).
-    var offset = 0
-    if let c = cache?.first {
-        offset = c.offset
-    }
-    return createCausalMask(n: N, offset: offset)
+    return nil  // Will be handled by SDPA internally when nil
 }
 
 // MARK: - Model

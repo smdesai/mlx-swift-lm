@@ -1,5 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
+// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/internlm2.py
+
 import Foundation
 import MLX
 import MLXLMCommon
@@ -7,7 +9,7 @@ import MLXNN
 
 // Port of https://github.com/maiqingqiang/mlx-examples/blob/main/llms/mlx_lm/models/internlm2.py
 
-class Internlm2DynamicNTKScalingRoPE: Module {
+class Internlm2DynamicNTKScalingRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
     let maxPositionEmbeddings: Int
     let traditional: Bool
@@ -25,25 +27,27 @@ class Internlm2DynamicNTKScalingRoPE: Module {
         self.scale = scale
     }
 
-    func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
-        let seqLen = x.dim(1) + offset
+    private func computeBase(seqLen: Int) -> Float {
         var base = originalBase
         if seqLen > maxPositionEmbeddings {
             base *= pow(
                 (scale * Float(seqLen) / Float(maxPositionEmbeddings)) - (scale - 1),
                 Float(dims) / Float(dims - 2))
         }
+        return base
+    }
+
+    public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        let base = computeBase(seqLen: x.dim(1) + offset)
         return MLXFast.RoPE(
             x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     }
 
-    /// Overload for batched generation with per-sequence offsets
-    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
-        // For batch mode, use the original base (conservative approach)
-        // The dynamic scaling would require per-sequence computation
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        let maxOffset = offset.max().item(Int.self)
+        let base = computeBase(seqLen: x.dim(1) + maxOffset)
         return MLXFast.RoPE(
-            x, dimensions: dims, traditional: traditional, base: originalBase, scale: scale,
-            offset: offset)
+            x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     }
 }
 
@@ -115,13 +119,8 @@ class Internlm2Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

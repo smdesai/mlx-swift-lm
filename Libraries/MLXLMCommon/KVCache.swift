@@ -82,6 +82,9 @@ public protocol KVCache: Evaluatable {
     func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode
+
+    /// Create an independent deep copy of this cache.
+    func copy() -> any KVCache
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -166,6 +169,10 @@ open class BaseKVCache: KVCache {
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
 
+    open func copy() -> any KVCache {
+        fatalError("copy() must be implemented by subclass")
+    }
+
     /// Default implementation for caches without special mask requirements
     open func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
@@ -206,6 +213,31 @@ public func createCausalMask(
     }
 
     return mask
+}
+
+/// Create an attention mask matching mlx-lm's create_attention_mask helper.
+///
+/// This returns `.causal` when a symbolic mask is sufficient, avoiding
+/// materializing a full mask array.
+public func makeAttentionMask(
+    n: Int,
+    cache: KVCache?,
+    windowSize: Int? = nil,
+    returnArray: Bool = false
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    if let cache {
+        return cache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    if n == 1 {
+        return .none
+    }
+
+    if returnArray || (windowSize != nil && n > windowSize!) {
+        return .array(createCausalMask(n: n, offset: 0, windowSize: windowSize))
+    }
+
+    return .causal
 }
 
 /// Dynamic roll with per-element shift amounts
@@ -309,7 +341,7 @@ public func rightPadPrompts(_ prompts: [[Int]], maxLength: Int? = nil) -> MLXArr
 
 /// Create an attention mask using the parameters from the KVCache.
 ///
-/// See also ``MultiHeadAttention/createAdditiveCausalMask(_:dtype:)`` -- same idea
+/// See also `MultiHeadAttention.createAdditiveCausalMask(_:dtype:)` -- same idea
 /// but doesn't honor the cache offset.
 @_disfavoredOverload
 public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
@@ -508,6 +540,16 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
 
         return quantizedCache
+    }
+
+    public override func copy() -> any KVCache {
+        let new = KVCacheSimple()
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        return new
     }
 
     public var debugDescription: String {
@@ -771,6 +813,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx)"
     }
 
+    public override func copy() -> any KVCache {
+        let new = RotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.metaState = self.metaState
+        return new
+    }
+
     /// Convert to quantized cache
     /// Note: This is complex due to the rotating nature and temporal ordering
     public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
@@ -1016,6 +1068,16 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         return trimmed
     }
 
+    public override func copy() -> any KVCache {
+        let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.metaState = self.metaState
+        return new
+    }
+
     /// Convert to unquantized cache
     public func toUnquantized() -> KVCacheSimple {
         let simpleCache = KVCacheSimple()
@@ -1103,6 +1165,17 @@ public class ChunkedKVCache: KVCacheSimple {
         let trimmed = min(offset - startPosition, n)
         offset -= trimmed
         return trimmed
+    }
+
+    public override func copy() -> any KVCache {
+        let new = ChunkedKVCache(chunkSize: chunkSize)
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.metaState = self.metaState
+        return new
     }
 
     public override var metaState: [String] {
@@ -1743,7 +1816,7 @@ public class BatchRotatingKVCache: BaseKVCache {
 /// Base cache for array-based state storage
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
-    private var leftPadding: MLXArray?
+    internal var leftPadding: MLXArray?
 
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
@@ -1767,6 +1840,17 @@ public class ArraysCache: BaseKVCache {
         set {
             cache = newValue.map { $0 as MLXArray? }
         }
+    }
+
+    public override func copy() -> any KVCache {
+        let new = ArraysCache(size: cache.count)
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.offset = self.offset
+        new.leftPadding = self.leftPadding
+        return new
     }
 
     /// In-place filter to keep just the given indices in the cache
@@ -1803,6 +1887,17 @@ public class MambaCache: ArraysCache {
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
+
+    public override func copy() -> any KVCache {
+        let new = MambaCache()
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.offset = self.offset
+        new.leftPadding = self.leftPadding
+        return new
+    }
 }
 
 /// Composite cache that manages multiple sub-caches
@@ -1817,6 +1912,11 @@ public class CacheList: BaseKVCache {
     }
 
     public init(array caches: [KVCache]) {
+        self.caches = caches
+        super.init()
+    }
+
+    public init(_ caches: [any KVCache]) {
         self.caches = caches
         super.init()
     }
@@ -1844,6 +1944,12 @@ public class CacheList: BaseKVCache {
                 start += length
             }
         }
+    }
+
+    public override func copy() -> any KVCache {
+        let copiedCaches = caches.map { $0.copy() }
+        let new = CacheList(copiedCaches)
+        return new
     }
 
     public override var isTrimmable: Bool {
@@ -2175,6 +2281,7 @@ public func canTrimPromptCache(_ cache: [KVCache]) -> Bool {
 @discardableResult
 public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
+    cache.dropFirst().forEach { $0.trim(numTokens) }
     return cache.first?.trim(numTokens) ?? 0
 }
 

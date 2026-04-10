@@ -17,11 +17,8 @@ enum GraniteMoeHybridLayerType {
     case attention
 }
 
-private func createSSMMask(cache: KVCache?, sequenceLength: Int) -> MLXArray? {
-    if let arraysCache = cache as? ArraysCache {
-        return arraysCache.makeMask(N: sequenceLength)
-    }
-    return nil
+private func createSSMMask(cache: KVCache?) -> MLXArray? {
+    nil
 }
 
 class GraniteMoeHybridRMSNormGated: Module {
@@ -200,7 +197,7 @@ class GraniteMoeHybridAttention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: RoPE?
+    let rope: RoPELayer?
 
     init(_ args: GraniteMoeHybridConfiguration) {
         self.args = args
@@ -221,12 +218,10 @@ class GraniteMoeHybridAttention: Module {
         if args.positionEmbeddingType == "nope" {
             self.rope = nil
         } else {
-            self.rope = RoPE(
-                dimensions: headDim,
-                traditional: false,
-                base: args.ropeTheta,
-                scale: 1
-            )
+            self.rope = initializeRope(
+                dims: headDim, base: args.ropeTheta,
+                traditional: false, scalingConfig: nil,
+                maxPositionEmbeddings: args.maxPositionEmbeddings)
         }
 
         super.init()
@@ -250,18 +245,8 @@ class GraniteMoeHybridAttention: Module {
         values = values.reshaped(B, L, args.kvHeads, headDim).transposed(0, 2, 1, 3)
 
         if let rope {
-            if let cache {
-                if cache.useArrayOffset {
-                    queries = rope(queries, offset: cache.ropeOffset)
-                    keys = rope(keys, offset: cache.ropeOffset)
-                } else {
-                    queries = rope(queries, offset: cache.offset)
-                    keys = rope(keys, offset: cache.offset)
-                }
-            } else {
-                queries = rope(queries)
-                keys = rope(keys)
-            }
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
         let output = attentionWithCacheUpdate(
@@ -487,8 +472,7 @@ public class GraniteMoeHybridModelInner: Module {
         let ssmMask = createSSMMask(
             cache: firstMambaIndex.flatMap { index in
                 cache?[index]
-            },
-            sequenceLength: inputs.dim(1))
+            })
 
         for (i, layer) in layers.enumerated() {
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache?[i])

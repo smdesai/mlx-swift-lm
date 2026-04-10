@@ -1,10 +1,8 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
-import Hub
 import MLX
 import MLXNN
-import Tokenizers
 
 /// Time/Height/Width struct to represent information about input images.
 public struct THW: Sendable {
@@ -168,12 +166,19 @@ public protocol LanguageModel: Module {
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
 
-    /// create a new array of ``KVCache`` -- automatic implementation if self
+    /// create a new array of ``KVCache``: automatic implementation if self
     /// implements ``KVCacheDimensionProvider``
     func newCache(parameters: GenerateParameters?) -> [KVCache]
 
     /// Optionally preprocess the weights and modify / remove values as needed.
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
+
+    /// Optionally preprocess the weights with access to safetensor metadata.
+    ///
+    /// The default implementation forwards to ``sanitize(weights:)``.
+    /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
+    /// and skip or customize sanitization accordingly.
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
 }
 
 extension LanguageModel {
@@ -192,6 +197,12 @@ extension LanguageModel {
 extension LanguageModel {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
+    }
+
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+        MLXArray]
+    {
+        sanitize(weights: weights)
     }
 }
 

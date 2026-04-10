@@ -4,7 +4,7 @@
 //
 //  Created by Sachin Desai 10/15/25.
 //
-//  Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/nanochat.py
+//  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/nanochat.py
 //
 
 import Foundation
@@ -79,23 +79,11 @@ final class NanoChatAttention: Module {
         let offset = cache?.ropeOffset ?? MLXArray(0)
         let freqs = _ropeFreqs
         queries = MLXFast.RoPE(
-            queries,
-            dimensions: headDim,
-            traditional: false,
-            base: nil,
-            scale: 1.0,
-            offset: offset,
-            freqs: freqs
-        )
+            queries, dimensions: headDim, traditional: false, base: nil,
+            scale: 1.0, offset: offset, freqs: freqs)
         keys = MLXFast.RoPE(
-            keys,
-            dimensions: headDim,
-            traditional: false,
-            base: nil,
-            scale: 1.0,
-            offset: offset,
-            freqs: freqs
-        )
+            keys, dimensions: headDim, traditional: false, base: nil,
+            scale: 1.0, offset: offset, freqs: freqs)
 
         queries = functionalRMSNorm(queries, eps: config.rmsNormEps)
         keys = functionalRMSNorm(keys, eps: config.rmsNormEps)

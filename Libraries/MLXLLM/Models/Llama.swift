@@ -4,146 +4,8 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-import Tokenizers
 
-// port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/llama.py
-
-func computeBaseFrequency(
-    base: Float, dims: Int, ropeType: String, ropeScaling: [String: StringOrNumber]?
-)
-    -> Float
-{
-    if ropeType != "llama3" {
-        return base
-    }
-
-    guard let ropeScaling = ropeScaling else {
-        return base
-    }
-
-    guard case .float(let factor) = ropeScaling["factor"],
-        case .float(let lowFreqFactor) = ropeScaling["low_freq_factor"] ?? .float(1.0),
-        case .float(let highFreqFactor) = ropeScaling["high_freq_factor"] ?? .float(4.0),
-        case .float(let oldContextLen) = ropeScaling["original_max_position_embeddings"]
-            ?? .float(8192)
-    else {
-        return base
-    }
-
-    let lowFreqWavelen = oldContextLen / lowFreqFactor
-    let highFreqWavelen = oldContextLen / highFreqFactor
-
-    let freqs = (0 ..< dims).compactMap { index -> Float? in
-        if index % 2 == 0 {
-            return pow(base, Float(index) / Float(dims))
-        }
-        return nil
-    }
-
-    let newBaseFreqs = freqs.map { freq -> Float in
-        let wavelen = 2 * .pi / freq
-        let smooth = max(
-            0, min(1, (wavelen - highFreqWavelen) / (lowFreqWavelen - highFreqWavelen)))
-        return freq * ((1 - smooth) * factor + smooth)
-    }
-
-    return newBaseFreqs.reduce(0, +) / Float(newBaseFreqs.count)
-}
-
-class LlamaDynamicNTKScalingRoPE: Module {
-    let dims: Int
-    let maxPositionEmbeddings: Int
-    let traditional: Bool
-    var base: Float?
-    let scale: Float
-    let ropeType: String
-    let ropeScaling: [String: StringOrNumber]?
-    var freqs: MLXArray?
-
-    init(
-        dims: Int,
-        maxPositionEmbeddings: Int?,
-        traditional: Bool = false,
-        base: Float = 10000,
-        scale: Float = 1.0,
-        ropeType: String = "default",
-        ropeScaling: [String: StringOrNumber]? = nil
-    ) {
-        self.dims = dims
-        self.maxPositionEmbeddings = maxPositionEmbeddings ?? 2048
-        self.traditional = traditional
-        self.base = base
-        self.scale = scale
-        self.ropeType = ropeType
-        self.ropeScaling = ropeScaling
-        super.init()
-        computeFreqs()
-    }
-
-    private func computeFreqs() {
-        if ropeType != "llama3" {
-            freqs = nil
-            return
-        }
-
-        guard let ropeScaling = ropeScaling,
-            case .float(let factor) = ropeScaling["factor"],
-            case .float(let lowFreqFactor) = ropeScaling["low_freq_factor"] ?? .float(1.0),
-            case .float(let highFreqFactor) = ropeScaling["high_freq_factor"] ?? .float(4.0),
-            case .float(let oldContextLen) = ropeScaling["original_max_position_embeddings"]
-                ?? .float(8192),
-            let base
-        else {
-            freqs = nil
-            return
-        }
-
-        let lowFreqWavelen = oldContextLen / lowFreqFactor
-        let highFreqWavelen = oldContextLen / highFreqFactor
-
-        let indices = MLXArray(stride(from: 0, to: dims, by: 2))
-        var frequencies = MLX.pow(base, indices / Float(dims))
-        let wavelens = 2 * Float.pi * frequencies
-
-        frequencies = MLX.where(
-            wavelens .> MLXArray(lowFreqWavelen), frequencies * factor, frequencies)
-        let isMediumFreq = MLX.logicalAnd(
-            wavelens .> MLXArray(highFreqWavelen),
-            wavelens .< MLXArray(lowFreqWavelen)
-        )
-        let smoothFactors =
-            (oldContextLen / wavelens - lowFreqFactor) / (highFreqFactor - lowFreqFactor)
-        let smoothFreqs = frequencies / ((1 - smoothFactors) / factor + smoothFactors)
-
-        freqs = MLX.where(isMediumFreq, smoothFreqs, frequencies)
-        self.base = nil
-    }
-
-    func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
-        MLXFast.RoPE(
-            x,
-            dimensions: dims,
-            traditional: traditional,
-            base: base,
-            scale: scale,
-            offset: offset,
-            freqs: freqs
-        )
-    }
-
-    /// Overload for batched generation with per-sequence offsets
-    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
-        MLXFast.RoPE(
-            x,
-            dimensions: dims,
-            traditional: traditional,
-            base: base,
-            scale: scale,
-            offset: offset,
-            freqs: freqs
-        )
-    }
-}
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/llama.py
 
 class LlamaAttention: Module {
 
@@ -155,7 +17,7 @@ class LlamaAttention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: LlamaDynamicNTKScalingRoPE
+    let rope: RoPELayer
 
     init(_ args: LlamaConfiguration) {
         self.args = args
@@ -172,20 +34,11 @@ class LlamaAttention: Module {
         self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: args.attentionBias)
         self._wo.wrappedValue = Linear(heads * headDim, dim, bias: args.attentionBias)
 
-        self.rope = LlamaDynamicNTKScalingRoPE(
-            dims: headDim,
-            maxPositionEmbeddings: args.maxPositionEmbeddings,
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
             traditional: args.ropeTraditional,
-            base: args.ropeTheta,
-            scale: 1.0,
-            ropeType: {
-                if case .string(let value) = args.ropeScaling?["type"] {
-                    return value
-                } else {
-                    return "default"
-                }
-            }(),
-            ropeScaling: args.ropeScaling)
+            scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     func callAsFunction(
@@ -202,13 +55,8 @@ class LlamaAttention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

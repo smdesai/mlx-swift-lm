@@ -3,7 +3,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/phimoe.py
+// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/phimoe.py
 
 public struct PhiMoEConfiguration: Codable, Sendable {
     var modelType: String = "phimoe"
@@ -91,13 +91,8 @@ class PhiMoEAttention: Module {
         var k = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         let v = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            q = rope(q, offset: cache.ropeOffset)
-            k = rope(k, offset: cache.ropeOffset)
-        } else {
-            q = rope(q)
-            k = rope(k)
-        }
+        q = applyRotaryPosition(rope, to: q, cache: cache)
+        k = applyRotaryPosition(rope, to: k, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: q,

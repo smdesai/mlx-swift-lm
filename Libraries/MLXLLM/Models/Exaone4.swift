@@ -26,7 +26,7 @@ class Exaone4Attention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rope: RoPE?
+    let rope: RoPELayer?
 
     public init(_ args: Exaone4Configuration, isLocal: Bool?) {
         self.args = args
@@ -49,22 +49,10 @@ class Exaone4Attention: Module {
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
         if useRope {
-            let ropeScale: Float
-            if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-                let factor = ropeScaling["factor"]
-            {
-                if let v = factor.asFloat() {
-                    ropeScale = 1 / v
-                } else {
-                    fatalError("ropeScaling.factor must be a float")
-                }
-            } else {
-                ropeScale = 1
-            }
-
-            self.rope = RoPE(
-                dimensions: headDim, traditional: false, base: args.ropeTheta,
-                scale: ropeScale)
+            self.rope = initializeRope(
+                dims: headDim, base: args.ropeTheta,
+                traditional: false, scalingConfig: args.ropeScaling,
+                maxPositionEmbeddings: args.maxPositionEmbeddings)
         } else {
             self.rope = nil
         }
@@ -83,12 +71,9 @@ class Exaone4Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache, useRope, let rope {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else if useRope, let rope {
-            queries = rope(queries)
-            keys = rope(keys)
+        if useRope, let rope {
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
         let output = attentionWithCacheUpdate(

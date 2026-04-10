@@ -143,7 +143,7 @@ class AfMoEAttention: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
 
     // RoPE is only used for local (sliding window) attention
-    let rope: RoPE?
+    let rope: RoPELayer?
 
     init(_ args: AfMoEConfiguration, isLocalAttention: Bool = false) {
         self.hiddenSize = args.hiddenSize
@@ -165,19 +165,10 @@ class AfMoEAttention: Module {
 
         // RoPE is only used for local (sliding window) attention
         if isLocalAttention {
-            // Handle rope scaling if present
-            var ropeScale: Float = 1.0
-            if let ropeScaling = args.ropeScaling,
-                ropeScaling["type"] == .string("linear"),
-                let factor = ropeScaling["factor"]?.asFloat()
-            {
-                ropeScale = 1.0 / factor
-            }
-            self.rope = RoPE(
-                dimensions: headDim,
-                traditional: false,
-                base: args.ropeTheta,
-                scale: ropeScale
+            self.rope = initializeRope(
+                dims: headDim, base: args.ropeTheta,
+                traditional: false, scalingConfig: args.ropeScaling,
+                maxPositionEmbeddings: nil
             )
         } else {
             self.rope = nil
@@ -206,13 +197,8 @@ class AfMoEAttention: Module {
 
         // Apply RoPE only for local (sliding window) attention
         if isLocalAttention, let rope = rope {
-            if let cache = cache {
-                queries = rope(queries, offset: cache.ropeOffset)
-                keys = rope(keys, offset: cache.ropeOffset)
-            } else {
-                queries = rope(queries)
-                keys = rope(keys)
-            }
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
         var output = attentionWithCacheUpdate(

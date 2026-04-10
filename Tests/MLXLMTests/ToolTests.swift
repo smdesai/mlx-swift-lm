@@ -155,6 +155,34 @@ struct ToolTests {
         #expect(toolCall.function.arguments["timezone"] == .string("UTC"))
     }
 
+    @Test("Test Pythonic Tool Call Parser - Nested Parentheses in Argument Value")
+    func testPythonicParserNestedParentheses() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content =
+            "<|tool_call_start|>[run_script(code=\"response = requests.get('https://api.example.com/data')\")] <|tool_call_end|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "run_script")
+        #expect(
+            toolCall.function.arguments["code"]
+                == .string("response = requests.get('https://api.example.com/data')"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Nested Parentheses Without Brackets")
+    func testPythonicParserNestedParenthesesNoBrackets() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content =
+            "<|tool_call_start|>run_script(code=\"print('hello')\")<|tool_call_end|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "run_script")
+        #expect(toolCall.function.arguments["code"] == .string("print('hello')"))
+    }
+
     @Test("Test Pythonic Tool Call Parser - No Arguments")
     func testPythonicParserNoArguments() throws {
         let parser = PythonicToolCallParser(
@@ -166,6 +194,33 @@ struct ToolTests {
 
         #expect(toolCall.function.name == "current_time")
         #expect(toolCall.function.arguments.isEmpty)
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Multiple Tools via parseEOS")
+    func testPythonicParserMultipleToolsEOS() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+
+        let content1 =
+            "<|tool_call_start|>[get_weather(location='Paris'), current_time(timezone=\"UTC\")]<|tool_call_end|>"
+        let toolCalls1 = parser.parseEOS(content1, tools: nil)
+
+        #expect(toolCalls1.count == 2)
+        #expect(toolCalls1[0].function.name == "get_weather")
+        #expect(toolCalls1[0].function.arguments["location"] == .string("Paris"))
+        #expect(toolCalls1[1].function.name == "current_time")
+        #expect(toolCalls1[1].function.arguments["timezone"] == .string("UTC"))
+
+        // Multiple distinct tool call blocks
+        let content2 =
+            "<|tool_call_start|>[get_weather(location='London')]<|tool_call_end|> <text> <|tool_call_start|>[current_time(timezone='UTC')]<|tool_call_end|>"
+        let toolCalls2 = parser.parseEOS(content2, tools: nil)
+
+        #expect(toolCalls2.count == 2)
+        #expect(toolCalls2[0].function.name == "get_weather")
+        #expect(toolCalls2[0].function.arguments["location"] == .string("London"))
+        #expect(toolCalls2[1].function.name == "current_time")
+        #expect(toolCalls2[1].function.arguments["timezone"] == .string("UTC"))
     }
 
     @Test("Test Pythonic Tool Call Parser - Type Conversion")
@@ -213,7 +268,7 @@ struct ToolTests {
 
     @Test("Test XML Function Parser - Qwen3 Coder Format")
     func testXMLFunctionParser() throws {
-        let parser = XMLFunctionParser()
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         let content =
             "<function=get_weather><parameter=location>Tokyo</parameter><parameter=unit>celsius</parameter></function>"
 
@@ -226,7 +281,7 @@ struct ToolTests {
 
     @Test("Test XML Function Parser - With Type Conversion")
     func testXMLFunctionParserTypeConversion() throws {
-        let parser = XMLFunctionParser()
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         let tools: [[String: any Sendable]] = [
             [
                 "function": [
@@ -248,6 +303,97 @@ struct ToolTests {
         #expect(toolCall.function.name == "set_temperature")
         #expect(toolCall.function.arguments["value"] == .int(25))
         #expect(toolCall.function.arguments["enabled"] == .bool(true))
+    }
+
+    @Test("Test XML Function Parser - Multiline Content (Qwen3.5 style)")
+    func testXMLFunctionParserMultiline() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        // Qwen3.5 models generate newlines between the XML tags
+        let content = """
+            <tool_call>
+            <function=get_current_datetime>
+            </function>
+            </tool_call>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_current_datetime")
+        #expect(toolCall.function.arguments.isEmpty)
+    }
+
+    @Test("Test XML Function Parser - Multiline Parameters")
+    func testXMLFunctionParserMultilineParams() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = """
+            <function=get_weather>
+            <parameter=location>
+            Tokyo
+            </parameter>
+            </function>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper)
+
+    @Test("Test Qwen3.5 XML Function Parser - With tool_call Tags")
+    func testQwen35Parser() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = """
+            <tool_call>
+            <function=get_weather>
+            <parameter=location>
+            San Francisco
+            </parameter>
+            <parameter=unit>
+            celsius
+            </parameter>
+            </function>
+            </tool_call>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("San Francisco"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Qwen3.5 Format via ToolCallProcessor")
+    func testQwen35FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let chunks: [String] = [
+            "<tool", "_call>", "\n<function=get_weather>\n",
+            "<parameter=location>\nTokyo\n</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+
+        for chunk in chunks {
+            _ = processor.processChunk(chunk)
+        }
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Test Qwen3.5 Format - No Arguments")
+    func testQwen35FormatNoArgs() throws {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let content = "<tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_current_datetime")
+        #expect(toolCall.function.arguments.isEmpty)
     }
 
     // MARK: - GLM4 Format Tests
@@ -376,6 +522,73 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("AI news"))
     }
 
+    // MARK: - Llama 3 Format Tests
+
+    @Test("Test Llama 3 Tool Call Parser")
+    func testLlama3Parser() throws {
+        let parser = Llama3ToolCallParser()
+
+        let content1 = """
+            <|python_tag|>{"name": "knowledge_search", "parameters": {"query": "example"}}
+            """
+
+        let toolCall1 = try #require(parser.parse(content: content1, tools: nil))
+        #expect(toolCall1.function.name == "knowledge_search")
+        #expect(toolCall1.function.arguments["query"] == .string("example"))
+
+        let content2 = """
+            {"name": "get_weather", "arguments": {"location": "Tokyo"}}
+            """
+
+        let toolCall2 = try #require(parser.parse(content: content2, tools: nil))
+        #expect(toolCall2.function.name == "get_weather")
+        #expect(toolCall2.function.arguments["location"] == .string("Tokyo"))
+
+        // Pythonic format
+        let content3 = """
+            <|python_tag|>get_weather(location="San Francisco, CA")
+            """
+
+        let toolCall3 = try #require(parser.parse(content: content3, tools: nil))
+        #expect(toolCall3.function.name == "get_weather")
+        #expect(toolCall3.function.arguments["location"] == .string("San Francisco, CA"))
+
+        // Multiple arguments Pythonic
+        let content4 = """
+            <|python_tag|>calculate(expression="2 + 2", precision=4)
+            """
+
+        let toolCall4 = try #require(parser.parse(content: content4, tools: nil))
+        #expect(toolCall4.function.name == "calculate")
+        #expect(toolCall4.function.arguments["expression"] == .string("2 + 2"))
+        #expect(toolCall4.function.arguments["precision"] == .string("4"))
+
+        // Multiple JSON list format via parseEOS
+        let content5 = """
+            <|python_tag|>[
+              {"name": "get_weather", "parameters": {"location": "New York"}},
+              {"name": "get_time", "parameters": {"location": "London"}}
+            ]
+            """
+        let toolCalls5 = parser.parseEOS(content5, tools: nil)
+        #expect(toolCalls5.count == 2)
+        #expect(toolCalls5[0].function.name == "get_weather")
+        #expect(toolCalls5[0].function.arguments["location"] == .string("New York"))
+        #expect(toolCalls5[1].function.name == "get_time")
+        #expect(toolCalls5[1].function.arguments["location"] == .string("London"))
+
+        // Multiple pythonic format via parseEOS
+        let content6 = """
+            <|python_tag|>[get_weather(location="New York"), get_time(location="London")]
+            """
+        let toolCalls6 = parser.parseEOS(content6, tools: nil)
+        #expect(toolCalls6.count == 2)
+        #expect(toolCalls6[0].function.name == "get_weather")
+        #expect(toolCalls6[0].function.arguments["location"] == .string("New York"))
+        #expect(toolCalls6[1].function.name == "get_time")
+        #expect(toolCalls6[1].function.arguments["location"] == .string("London"))
+    }
+
     // MARK: - ToolCallFormat Serialization Tests
 
     @Test("Test ToolCallFormat Raw Values for Serialization")
@@ -388,6 +601,7 @@ struct ToolTests {
         #expect(ToolCallFormat.gemma.rawValue == "gemma")
         #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
         #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
+        #expect(ToolCallFormat.mistral.rawValue == "mistral")
 
         // Test round-trip via raw value
         for format in ToolCallFormat.allCases {
@@ -418,9 +632,174 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
         #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
 
-        // Unknown models should return nil (use default)
-        #expect(ToolCallFormat.infer(from: "llama") == nil)
+        // Nemotron models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .xmlFunction)
+
+        // Qwen3.5 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .xmlFunction)
+
+        // Mistral3 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
+        #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)
+        #expect(ToolCallFormat.infer(from: "mistral3_text") == .mistral)
+
+        // Llama models - require secondary signals from configData
+        #expect(ToolCallFormat.infer(from: "llama") == nil)  // Should be nil without configData
+
+        let llama3RopeConfig = """
+            {
+                "model_type": "llama",
+                "rope_scaling": {
+                    "rope_type": "llama3"
+                }
+            }
+            """.data(using: .utf8)!
+        #expect(ToolCallFormat.infer(from: "llama", configData: llama3RopeConfig) == .llama3)
+
+        let llama3VocabConfig = """
+            {
+                "model_type": "llama",
+                "vocab_size": 128256
+            }
+            """.data(using: .utf8)!
+        #expect(ToolCallFormat.infer(from: "LLAMA", configData: llama3VocabConfig) == .llama3)
+
+        let llama2Config = """
+            {
+                "model_type": "llama",
+                "vocab_size": 32000
+            }
+            """.data(using: .utf8)!
+        #expect(ToolCallFormat.infer(from: "llama", configData: llama2Config) == nil)
+
+        // Unknown models should return nil (use default JSON format)
         #expect(ToolCallFormat.infer(from: "qwen2") == nil)
         #expect(ToolCallFormat.infer(from: "mistral") == nil)
+    }
+
+    // MARK: - Mistral Format Tests
+
+    @Test("Test Mistral Tool Call Parser")
+    func testMistralParser() throws {
+        let parser = MistralToolCallParser()
+        let content = "[TOOL_CALLS]get_weather [ARGS]{\"location\": \"Paris\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Test Mistral Tool Call Parser - With Call ID")
+    func testMistralParserWithCallId() throws {
+        let parser = MistralToolCallParser()
+        let content = "[TOOL_CALLS]get_weather[CALL_ID]abc123xyz[ARGS]{\"location\": \"Paris\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Test Mistral Tool Call Parser - Preserves [TOOL_CALLS] in Arguments")
+    func testMistralParserPreservesStartTagInArguments() throws {
+        let parser = MistralToolCallParser()
+        let content = "get_note[ARGS]{\"text\": \"literal [TOOL_CALLS] marker\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_note")
+        #expect(toolCall.function.arguments["text"] == .string("literal [TOOL_CALLS] marker"))
+    }
+
+    @Test("Test Mistral Tool Call Parser - Preserves </s> in Arguments")
+    func testMistralParserPreservesEndTagInArguments() throws {
+        let parser = MistralToolCallParser()
+        let content = "get_note[ARGS]{\"text\": \"literal </s> marker\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_note")
+        #expect(toolCall.function.arguments["text"] == .string("literal </s> marker"))
+    }
+
+    @Test("Test Mistral Format via ToolCallProcessor")
+    func testMistralFormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .mistral)
+        let chunks: [String] = [
+            "[TOOL", "_CALLS]", "get_weather", " [ARGS]",
+            "{\"location\":", " \"Tokyo\"}",
+        ]
+
+        for chunk in chunks {
+            _ = processor.processChunk(chunk)
+        }
+
+        // End tag never arrives in text, so tool call stays buffered until processEOS
+        #expect(processor.toolCalls.count == 0)
+
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Test Mistral Format Processor EOS")
+    func testMistralFormatProcessorEOS() throws {
+        let processor = ToolCallProcessor(format: .mistral)
+        let content = "[TOOL_CALLS]get_weather [ARGS]{\"location\": \"Berlin\"}"
+
+        _ = processor.processChunk(content)
+
+        // Before processEOS, no tool calls extracted (end tag never arrives)
+        #expect(processor.toolCalls.count == 0)
+
+        // processEOS extracts the buffered tool call
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Berlin"))
+    }
+
+    @Test("Test Mistral Format Processor Multiple Tool Calls")
+    func testMistralFormatProcessorMultipleToolCalls() throws {
+        let processor = ToolCallProcessor(format: .mistral)
+        let chunks: [String] = [
+            "[TOOL_CALLS]get_weather[ARGS]",
+            "{\"location\": \"Paris\"}",
+            "[TOOL_CALLS]get_time",
+            "[ARGS]{\"timezone\": \"UTC\"}",
+        ]
+
+        for chunk in chunks {
+            let result = processor.processChunk(chunk)
+            // All chunks should be buffered (nil) after the start tag
+            if chunk == chunks.first {
+                #expect(result == nil)
+            }
+        }
+
+        // No tool calls before processEOS
+        #expect(processor.toolCalls.count == 0)
+
+        processor.processEOS()
+
+        // Both tool calls should be extracted
+        #expect(processor.toolCalls.count == 2)
+
+        let first = try #require(processor.toolCalls.first)
+        #expect(first.function.name == "get_weather")
+        #expect(first.function.arguments["location"] == .string("Paris"))
+
+        let second = processor.toolCalls[1]
+        #expect(second.function.name == "get_time")
+        #expect(second.function.arguments["timezone"] == .string("UTC"))
     }
 }

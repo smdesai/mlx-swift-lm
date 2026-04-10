@@ -71,7 +71,7 @@ class Ernie45Attention: Module {
     @ModuleInfo(key: "v_proj") var vProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     public init(_ args: Ernie45Configuration) {
         let dim = args.hiddenSize
@@ -85,11 +85,10 @@ class Ernie45Attention: Module {
         self._vProj.wrappedValue = Linear(dim, nKVHeads * headDim, bias: args.useBias)
         self._oProj.wrappedValue = Linear(nHeads * headDim, dim, bias: args.useBias)
 
-        self.rope = RoPE(
-            dimensions: headDim,
-            traditional: true,
-            base: args.ropeTheta
-        )
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
+            traditional: true, scalingConfig: nil,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     public func callAsFunction(
@@ -105,13 +104,8 @@ class Ernie45Attention: Module {
         keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

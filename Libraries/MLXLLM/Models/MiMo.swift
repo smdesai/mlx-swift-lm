@@ -5,6 +5,8 @@
 //  Created by John Mai on 2025/5/3.
 //
 
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/mimo.py
+
 import Foundation
 import MLX
 import MLXLMCommon
@@ -19,7 +21,7 @@ class MiMoAttention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     public init(_ args: MiMoConfiguration) {
         self.args = args
@@ -36,22 +38,11 @@ class MiMoAttention: Module {
         _wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
         _wo.wrappedValue = Linear(heads * headDim, dim, bias: false)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
-                fatalError("ropeScaling.factor must be a float")
-            }
-        } else {
-            ropeScale = 1
-        }
-
-        self.rope = RoPE(
-            dimensions: headDim, traditional: args.ropeTraditional, base: args.ropeTheta,
-            scale: ropeScale)
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
+            traditional: args.ropeTraditional, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: nil
+        )
     }
 
     public func callAsFunction(
@@ -68,13 +59,8 @@ class MiMoAttention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,

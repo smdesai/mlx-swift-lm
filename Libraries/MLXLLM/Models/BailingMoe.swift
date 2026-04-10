@@ -89,7 +89,7 @@ class BailingMoeAttention: Module {
     @ModuleInfo(key: "query_layernorm") var qNorm: RMSNorm?
     @ModuleInfo(key: "key_layernorm") var kNorm: RMSNorm?
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     init(_ args: BailingMoeConfiguration) {
         self.args = args
@@ -114,9 +114,11 @@ class BailingMoeAttention: Module {
             _kNorm.wrappedValue = nil
         }
 
-        self.rope = RoPE(
-            dimensions: ropeDim, traditional: false, base: args.ropeTheta,
-            scale: 1.0)
+        self.rope = initializeRope(
+            dims: ropeDim, base: args.ropeTheta,
+            traditional: false, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: nil
+        )
     }
 
     func callAsFunction(
@@ -143,13 +145,8 @@ class BailingMoeAttention: Module {
         keys = keys.transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
-            queries = rope(queries, offset: cache.ropeOffset)
-            keys = rope(keys, offset: cache.ropeOffset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
