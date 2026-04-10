@@ -1,6 +1,6 @@
 # Batch Generation Model Test Coverage
 
-## Tested in Batch Harness (24 models, all ≤7B)
+## Tested in Batch Harness (25 models, all ≤7B)
 
 | Architecture | Model | Size | Single | Batch |
 |---|---|---|---|---|
@@ -27,6 +27,7 @@
 | falcon_h1 | Falcon-H1-3B-Instruct-4bit | 3B | PASS* | PASS* (fixed) |
 | nanochat | nanochat-d20-mlx | tiny | PASS | PASS |
 | granite_4_0 | granite-4.0-h-micro-4bit | hybrid | PASS | PASS |
+| qwen3_5 | Qwen3.5-2B-4bit | 2B | PASS | PASS |
 
 *falcon_h1: no crash, but output is garbage in both single and batch — pre-existing model/quantization issue*
 
@@ -46,7 +47,7 @@
 | phimoe | MoE, no small 4-bit instruct model found |
 | qwen3_moe | Large MoE models only |
 | qwen3_next | New, no small 4-bit available |
-| qwen3_5 / qwen3_5_moe | Very new |
+| qwen3_5_moe | Large MoE variant of qwen3_5 |
 | deepseek_v3 | Large MoE only (236B+) |
 | granitemoehybrid | Hybrid MoE, tested separately as granite_4_0 |
 | mimo_v2_flash | New variant |
@@ -69,6 +70,6 @@
 
 ## Summary
 
-- **Coverage:** 24 of ~40 distinct architectures tested
+- **Coverage:** 25 of ~40 distinct architectures tested
 - **All common/popular architectures covered** with available ≤7B 4-bit instruct models
-- **Pass rate:** 47/48 tests pass (single + batch), 1 model (falcon_h1) has pre-existing output quality issue unrelated to batch
+- **Pass rate:** 49/50 tests pass (single + batch), 1 model (falcon_h1) has pre-existing output quality issue unrelated to batch

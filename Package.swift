@@ -41,7 +41,7 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
-            .upToNextMinor(from: "1.1.6")
+            .upToNextMinor(from: "1.2.0")
         ),
         .package(
             url: "https://github.com/apple/swift-argument-parser",
@@ -148,6 +148,18 @@ let package = Package(
             ],
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
+        ),
+        .executableTarget(
+            name: "SpecGenerate",
+            dependencies: [
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools/SpecGenerate"
         ),
         .testTarget(
             name: "MLXLMTests",

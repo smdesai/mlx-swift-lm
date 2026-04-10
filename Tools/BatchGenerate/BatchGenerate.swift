@@ -154,7 +154,7 @@ struct BatchGenerate: AsyncParsableCommand {
                     "Generation: \(info.generationTokenCount) tokens, \(String(format: "%.1f", info.tokensPerSecond)) tokens/sec"
                 )
                 printErr(
-                    "Peak memory: \(String(format: "%.2f", Double(GPU.peakMemory) / 1e9)) GB"
+                    "Peak memory: \(String(format: "%.2f", Double(Memory.peakMemory) / 1e9)) GB"
                 )
             case .toolCall:
                 break

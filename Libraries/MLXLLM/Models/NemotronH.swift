@@ -420,14 +420,14 @@ private class NemotronHMoEGate: Module {
     @ParameterInfo(key: "e_score_correction_bias") var eSCB: MLXArray
 
     init(_ args: NemotronHConfiguration) {
-        self.topK = args.numExpertsPerTok
+        self.topK = args.numExpertsPerTok!
         self.nGroup = args.nGroup
         self.topkGroup = args.topkGroup
         self.routedScalingFactor = args.routedScalingFactor
         self.normTopkProb = args.normTopkProb
 
-        self._weight.wrappedValue = MLXArray.zeros([args.nRoutedExperts, args.hiddenSize])
-        self._eSCB.wrappedValue = MLXArray.zeros([args.nRoutedExperts])
+        self._weight.wrappedValue = MLXArray.zeros([args.nRoutedExperts!, args.hiddenSize])
+        self._eSCB.wrappedValue = MLXArray.zeros([args.nRoutedExperts!])
 
         super.init()
     }
@@ -504,14 +504,14 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
 
     init(_ args: NemotronHConfiguration) {
-        self.numExpertsPerTok = args.numExpertsPerTok
+        self.numExpertsPerTok = args.numExpertsPerTok!
         self.hasSharedExperts = args.nSharedExperts != nil && args.nSharedExperts! > 0
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
         self._switchMLP.wrappedValue = NemotronHSwitchMLP(
             inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize,
-            numExperts: args.nRoutedExperts
+            hiddenDims: args.moeIntermediateSize!,
+            numExperts: args.nRoutedExperts!
         )
 
         if hasSharedExperts {
@@ -768,15 +768,17 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         }
 
         // Stack experts: backbone.layers.{l}.mixer.experts.{e}.{proj}.weight -> backbone.layers.{l}.mixer.switch_mlp.{proj}.weight
-        for l in 0 ..< configuration.numHiddenLayers {
-            let prefix = "backbone.layers.\(l).mixer"
-            for (m, n) in [("down_proj", "fc2"), ("up_proj", "fc1")] {
-                if sanitized["\(prefix).experts.0.\(m).weight"] != nil {
-                    let toJoin = (0 ..< configuration.nRoutedExperts).compactMap { e in
-                        sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(m).weight")
-                    }
-                    if !toJoin.isEmpty {
-                        sanitized["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
+        if let nRoutedExperts = configuration.nRoutedExperts {
+            for l in 0 ..< configuration.numHiddenLayers {
+                let prefix = "backbone.layers.\(l).mixer"
+                for (m, n) in [("down_proj", "fc2"), ("up_proj", "fc1")] {
+                    if sanitized["\(prefix).experts.0.\(m).weight"] != nil {
+                        let toJoin = (0 ..< nRoutedExperts).compactMap { e in
+                            sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(m).weight")
+                        }
+                        if !toJoin.isEmpty {
+                            sanitized["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
+                        }
                     }
                 }
             }
@@ -810,11 +812,11 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var convKernel: Int
     public var nGroups: Int
     public var intermediateSize: Int
-    public var moeIntermediateSize: Int
-    public var moeSharedExpertIntermediateSize: Int
-    public var nRoutedExperts: Int
+    public var moeIntermediateSize: Int?
+    public var moeSharedExpertIntermediateSize: Int?
+    public var nRoutedExperts: Int?
     public var nSharedExperts: Int?
-    public var numExpertsPerTok: Int
+    public var numExpertsPerTok: Int?
     public var hybridOverridePattern: String
     public var layerNormEpsilon: Float
     public var mlpBias: Bool
@@ -883,12 +885,12 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel = try container.decode(Int.self, forKey: .convKernel)
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
-        moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
-        moeSharedExpertIntermediateSize = try container.decode(
+        moeIntermediateSize = try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize)
+        moeSharedExpertIntermediateSize = try container.decodeIfPresent(
             Int.self, forKey: .moeSharedExpertIntermediateSize)
-        nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
+        nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts)
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
-        numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        numExpertsPerTok = try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok)
         layerNormEpsilon =
             try container.decodeIfPresent(Float.self, forKey: .layerNormEpsilon) ?? 1e-5
         mlpBias = try container.decodeIfPresent(Bool.self, forKey: .mlpBias) ?? false
@@ -917,17 +919,31 @@ public struct NemotronHConfiguration: Codable, Sendable {
                 debugDescription: "hybrid_override_pattern must be string or array of strings")
         }
 
-        // Handle time_step_limit - can be array [min, max] or separate fields
+        // Handle time_step_limit - can come from time_step_limit_min/max or time_step_min/max
+        // Python: if time_step_limit is None and time_step_min is not None:
+        //             time_step_limit = (time_step_min, float("inf"))
         if let limits = try? container.decode([Float].self, forKey: .timeStepLimitMin) {
-            // Actually this is time_step_limit as array
+            // time_step_limit as array [min, max]
             timeStepLimitMin = limits[0]
             timeStepLimitMax = limits.count > 1 ? limits[1] : limits[0]
-        } else {
-            timeStepLimitMin =
-                try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) ?? 0.0
+        } else if let limitMin = try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) {
+            timeStepLimitMin = limitMin
             timeStepLimitMax =
                 try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMax)
                 ?? Float.infinity
+        } else {
+            // Fallback to time_step_min/max (matching Python __post_init__)
+            enum FallbackKeys: String, CodingKey {
+                case timeStepMin = "time_step_min"
+            }
+            let fallback = try decoder.container(keyedBy: FallbackKeys.self)
+            if let stepMin = try fallback.decodeIfPresent(Float.self, forKey: .timeStepMin) {
+                timeStepLimitMin = stepMin
+                timeStepLimitMax = Float.infinity
+            } else {
+                timeStepLimitMin = 0.0
+                timeStepLimitMax = Float.infinity
+            }
         }
     }
 
@@ -944,10 +960,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel: Int,
         nGroups: Int,
         intermediateSize: Int,
-        moeIntermediateSize: Int,
-        moeSharedExpertIntermediateSize: Int,
-        nRoutedExperts: Int,
-        numExpertsPerTok: Int,
+        moeIntermediateSize: Int? = nil,
+        moeSharedExpertIntermediateSize: Int? = nil,
+        nRoutedExperts: Int? = nil,
+        numExpertsPerTok: Int? = nil,
         hybridOverridePattern: String,
         layerNormEpsilon: Float = 1e-5,
         attentionBias: Bool = false,
