@@ -7,6 +7,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
+import MLXVLM
 import Tokenizers
 
 @main
@@ -62,7 +63,10 @@ struct BatchGenerate: AsyncParsableCommand {
     }
 
     func run() async throws {
-        // Register LLM factory so loadModel(id:) can find it
+        // Register model factories so loadModel(id:) can find them.
+        // VLM is registered first so VLM-only models (e.g. gemma4) are resolved
+        // before falling through to the LLM factory.
+        ModelFactoryRegistry.shared.addTrampoline { VLMModelFactory.shared }
         ModelFactoryRegistry.shared.addTrampoline { LLMModelFactory.shared }
 
         // Resolve system prompt
@@ -108,9 +112,35 @@ struct BatchGenerate: AsyncParsableCommand {
         printErr("")  // newline after progress
         printErr("Model loaded.")
 
-        if prompts.count == 1 {
-            try await runSinglePrompt(
-                prompts[0], systemPrompt: effectiveSystemPrompt, context: context)
+        // Models with RotatingKVCache (e.g. Gemma 3/4 sliding window attention)
+        // don't produce correct output in batch mode due to left-padding offset
+        // issues in mixed KVCacheSimple + RotatingKVCache setups.
+        // Fall back to sequential single-prompt generation for these models.
+        let sampleCache = context.model.newCache(parameters: nil)
+        let hasRotatingCaches = sampleCache.contains { $0 is RotatingKVCache }
+
+        if prompts.count == 1 || hasRotatingCaches {
+            if hasRotatingCaches && prompts.count > 1 {
+                printErr(
+                    "Note: model uses sliding window attention, running \(prompts.count) prompts sequentially"
+                )
+            }
+            for (i, promptText) in prompts.enumerated() {
+                if prompts.count > 1 {
+                    print("")
+                    print("--- Prompt \(i + 1): \(promptText) ---")
+                }
+                try await runSinglePrompt(
+                    promptText, systemPrompt: effectiveSystemPrompt, context: context,
+                    showStats: prompts.count == 1)
+            }
+            if prompts.count > 1 {
+                printErr("")
+                printErr("--- Statistics ---")
+                printErr(
+                    "Peak memory: \(String(format: "%.2f", Double(Memory.peakMemory) / 1e9)) GB"
+                )
+            }
         } else {
             try await runBatchPrompts(
                 prompts, systemPrompt: effectiveSystemPrompt, context: context)
@@ -119,9 +149,10 @@ struct BatchGenerate: AsyncParsableCommand {
 
     // MARK: - Single Prompt (Streaming)
 
-    private func runSinglePrompt(_ promptText: String, systemPrompt: String?, context: ModelContext)
-        async throws
-    {
+    private func runSinglePrompt(
+        _ promptText: String, systemPrompt: String?, context: ModelContext,
+        showStats: Bool = true
+    ) async throws {
         var messages: [Chat.Message] = []
         if let systemPrompt, !systemPrompt.isEmpty {
             messages.append(.system(systemPrompt))
@@ -145,17 +176,19 @@ struct BatchGenerate: AsyncParsableCommand {
                 print(text, terminator: "")
             case .info(let info):
                 print("")  // newline after generated text
-                printErr("")
-                printErr("--- Statistics ---")
-                printErr(
-                    "Prompt: \(info.promptTokenCount) tokens, \(String(format: "%.1f", info.promptTokensPerSecond)) tokens/sec"
-                )
-                printErr(
-                    "Generation: \(info.generationTokenCount) tokens, \(String(format: "%.1f", info.tokensPerSecond)) tokens/sec"
-                )
-                printErr(
-                    "Peak memory: \(String(format: "%.2f", Double(Memory.peakMemory) / 1e9)) GB"
-                )
+                if showStats {
+                    printErr("")
+                    printErr("--- Statistics ---")
+                    printErr(
+                        "Prompt: \(info.promptTokenCount) tokens, \(String(format: "%.1f", info.promptTokensPerSecond)) tokens/sec"
+                    )
+                    printErr(
+                        "Generation: \(info.generationTokenCount) tokens, \(String(format: "%.1f", info.tokensPerSecond)) tokens/sec"
+                    )
+                    printErr(
+                        "Peak memory: \(String(format: "%.2f", Double(Memory.peakMemory) / 1e9)) GB"
+                    )
+                }
             case .toolCall:
                 break
             }
@@ -279,11 +312,12 @@ struct BatchGenerate: AsyncParsableCommand {
             }
         }
 
-        // Build stop tokens
+        // Build stop tokens from tokenizer and model configuration
         var stopTokens = Set<Int>()
         if let eos = context.tokenizer.eosTokenId {
             stopTokens.insert(eos)
         }
+        stopTokens.formUnion(context.configuration.eosTokenIds)
 
         // Create batch generator
         // Use smaller prefill step size for hybrid models (Mamba ssmAttn is O(L²) memory)

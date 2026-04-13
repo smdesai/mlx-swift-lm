@@ -3,7 +3,6 @@
 import Foundation
 import MLX
 import MLXNN
-import Tokenizers
 
 // MARK: - Batch Statistics
 

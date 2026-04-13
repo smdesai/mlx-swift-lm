@@ -39,14 +39,6 @@ let package = Package(
         //.package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
         .package(path: "/Users/sachin/Tools/MLX/experimental-batch/mlx-swift"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
-        .package(
-            url: "https://github.com/huggingface/swift-transformers",
-            .upToNextMinor(from: "1.2.0")
-        ),
-        .package(
-            url: "https://github.com/apple/swift-argument-parser",
-            from: "1.3.0"
-        ),
     ],
     targets: [
         .target(
@@ -81,7 +73,6 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
@@ -99,32 +90,6 @@ let package = Package(
             exclude: [
                 "README.md"
             ]
-        ),
-        .executableTarget(
-            name: "BatchGenerate",
-            dependencies: [
-                "MLXLLM",
-                "MLXLMCommon",
-                "MLXHuggingFace",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "Hub", package: "swift-transformers"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-            ],
-            path: "Tools/BatchGenerate"
-        ),
-        .executableTarget(
-            name: "VLMGenerate",
-            dependencies: [
-                "MLXVLM",
-                "MLXLMCommon",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-            ],
-            path: "Tools/VLMGenerate"
         ),
         .target(
             name: "BenchmarkHelpers",
@@ -148,18 +113,6 @@ let package = Package(
             ],
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
-        ),
-        .executableTarget(
-            name: "SpecGenerate",
-            dependencies: [
-                "MLXLLM",
-                "MLXLMCommon",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-            ],
-            path: "Tools/SpecGenerate"
         ),
         .testTarget(
             name: "MLXLMTests",
