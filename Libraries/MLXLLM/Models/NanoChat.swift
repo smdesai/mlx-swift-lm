@@ -76,7 +76,12 @@ final class NanoChatAttention: Module {
         keys = keys.reshaped(batchSize, sequenceLength, numKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(batchSize, sequenceLength, numKVHeads, -1).transposed(0, 2, 1, 3)
 
-        let offset = cache?.ropeOffset ?? MLXArray(0)
+        let offset: MLXArray =
+            if let batchCache = cache as? BatchPositionedKVCache {
+                batchCache.batchOffset
+            } else {
+                MLXArray(Int32(cache?.offset ?? 0))
+            }
         let freqs = _ropeFreqs
         queries = MLXFast.RoPE(
             queries, dimensions: headDim, traditional: false, base: nil,

@@ -228,8 +228,6 @@ class CoreMLCachePlaceholder: KVCache {
     }
 
     var offset: Int { owner?.currentOffset ?? 0 }
-    var ropeOffset: MLXArray { MLXArray(offset) }
-    var useArrayOffset: Bool { false }
     var maxSize: Int? { nil }
     var isTrimmable: Bool { true }
 

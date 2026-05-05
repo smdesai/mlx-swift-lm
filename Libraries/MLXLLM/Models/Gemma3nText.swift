@@ -263,11 +263,11 @@ class Gemma3nAttention: Module {
         queries = queries.reshaped(B, L, -1, headDim)
         queries = qNorm(queries)
 
-        let offset =
-            if isKvSharedLayer && cache != nil {
-                cache!.ropeOffset
+        let offset: MLXArray =
+            if let batchCache = cache as? BatchPositionedKVCache {
+                batchCache.batchOffset
             } else {
-                cache?.ropeOffset ?? MLXArray(0)
+                MLXArray(Int32(cache?.offset ?? 0))
             }
 
         var keys: MLXArray
@@ -313,7 +313,7 @@ class Gemma3nAttention: Module {
         var adjustedMask = mask
         if case .array(let maskArray) = mask {
             let keysSeqLen = keys.shape[keys.shape.count - 2]
-            if maskArray.shape.last! != keysSeqLen {
+            if maskArray.dim(-1) != keysSeqLen {
                 let slicedMask = maskArray[.ellipsis, 0 ..< keysSeqLen].asType(queries.dtype)
                 adjustedMask = .array(slicedMask)
             } else {
@@ -596,7 +596,7 @@ class Gemma3nDecoderLayer: Module {
 
         var finalMask = mask
         if isSliding, case .array(let maskArray) = mask {
-            let effectiveSeqLen = max(cachePosition?.shape[0] ?? 0, slidingWindow)
+            let effectiveSeqLen = max(cachePosition?.dim(0) ?? 0, slidingWindow)
             let minDtype = MLXArray(Float.leastNormalMagnitude, dtype: maskArray.dtype)
 
             let slidingWindowMask = tril(
@@ -606,7 +606,7 @@ class Gemma3nDecoderLayer: Module {
             let updatedMask = MLX.where(slidingWindowMask, minDtype, maskArray)
 
             let offset = max(0, (cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1)
-            let maskIndexes = MLXArray(0 ..< min(effectiveSeqLen, updatedMask.shape.last!)) + offset
+            let maskIndexes = MLXArray(0 ..< min(effectiveSeqLen, updatedMask.dim(-1))) + offset
             let slicedMask = take(updatedMask, maskIndexes.asType(.int32), axis: -1)
             finalMask = .array(slicedMask)
         }
@@ -829,7 +829,7 @@ public class Gemma3nLanguageModel: Module {
         let cacheArray = cache ?? Array(repeating: nil as KVCache?, count: requiredCacheSize)
 
         let pastSeenTokens = cacheArray.first??.offset ?? 0
-        let cachePosition = MLXArray(pastSeenTokens ..< (pastSeenTokens + h.shape[1]))
+        let cachePosition = MLXArray(pastSeenTokens ..< (pastSeenTokens + h.dim(1)))
 
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
         var slidingWindowMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
@@ -1037,7 +1037,7 @@ public class Gemma3nTextModel: Module, LLMModel {
         _ input: LMInput, cache: [KVCache], windowSize: Int? = nil
     ) throws -> PrepareResult {
         let promptTokens = input.text.tokens
-        let promptCount = promptTokens.shape[0]
+        let promptCount = promptTokens.dim(0)
 
         guard promptCount > 0 else {
             print("Warning: Preparing with empty prompt tokens.")
