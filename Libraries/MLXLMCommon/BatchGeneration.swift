@@ -334,7 +334,7 @@ public class BatchGenerator {
                 eval(promptCache.flatMap { $0.innerState() })
 
                 inputTokens = inputTokens[0..., nToProcess...]
-                GPU.clearCache()
+                Memory.clearCache()
             }
         } else {
             // Further prompt processing with existing caches
@@ -361,7 +361,7 @@ public class BatchGenerator {
                 eval(promptCache.flatMap { $0.innerState() })
 
                 inputTokens = inputTokens[0..., nToProcess...]
-                GPU.clearCache()
+                Memory.clearCache()
             }
 
             // Finalize caches
@@ -373,7 +373,7 @@ public class BatchGenerator {
                 }
             }
             eval(promptCache.flatMap { $0.innerState() })
-            GPU.clearCache()
+            Memory.clearCache()
 
             inputTokens = lastInputs
         }
@@ -613,7 +613,7 @@ public class BatchGenerator {
         if stats.generationTime > 0 {
             s.generationTPS = Double(stats.generationTokens) / stats.generationTime
         }
-        s.peakMemory = Double(GPU.peakMemory) / 1e9
+        s.peakMemory = Double(Memory.peakMemory) / 1e9
         return s
     }
 }
