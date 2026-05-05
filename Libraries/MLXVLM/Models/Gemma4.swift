@@ -67,9 +67,9 @@ private func gemma4MaskedScatter(
         return inputTensor
     }
 
-    guard flattenedSource.shape[0] == targetIndices.count else {
+    guard flattenedSource.dim(0) == targetIndices.count else {
         fatalError(
-            "Masked scatter shape mismatch. source=\(flattenedSource.shape[0]) mask=\(targetIndices.count)"
+            "Masked scatter shape mismatch. source=\(flattenedSource.dim(0)) mask=\(targetIndices.count)"
         )
     }
 
@@ -193,7 +193,8 @@ private func gemma4AdjustAttentionMask(
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
     switch mask {
     case .array(let maskArray):
-        guard let maskLength = maskArray.shape.last, maskLength > keyLength else {
+        let maskLength = maskArray.dim(-1)
+        guard maskLength > keyLength else {
             return mask
         }
         let start = maskLength - keyLength
@@ -1768,6 +1769,32 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
 // MARK: - Processor
 
+public struct Gemma4MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        if message.role == .system {
+            [
+                "role": message.role.rawValue,
+                "content": message.content,
+            ]
+        } else {
+            [
+                "role": message.role.rawValue,
+                "content": message.images.map { _ in
+                    ["type": "image"]
+                }
+                    + message.videos.map { _ in
+                        ["type": "video"]
+                    }
+                    + [
+                        ["type": "text", "text": message.content]
+                    ],
+            ]
+        }
+    }
+}
+
 public struct Gemma4Processor: UserInputProcessor {
     private let config: Gemma4ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -1804,7 +1831,7 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(from: input)
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
@@ -1812,10 +1839,6 @@ public struct Gemma4Processor: UserInputProcessor {
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
-            let imagePlaceholderCount = promptTokens.filter { $0 == config.imageTokenId }.count
-            let boiCount = promptTokens.filter { $0 == config.boiTokenId }.count
-            let eoiCount = promptTokens.filter { $0 == config.eoiTokenId }.count
-
             let imagePixelsAndFrames = try input.images.map {
                 try preprocess(images: [$0.asCIImage()], processing: input.processing)
             }
@@ -1840,10 +1863,6 @@ public struct Gemma4Processor: UserInputProcessor {
                 }
             }
             promptTokens = expandedTokens
-
-            let expandedImageTokenCount = promptTokens.filter { $0 == config.imageTokenId }.count
-            let expandedBoiCount = promptTokens.filter { $0 == config.boiTokenId }.count
-            let expandedEoiCount = promptTokens.filter { $0 == config.eoiTokenId }.count
         }
 
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
