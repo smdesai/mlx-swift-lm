@@ -358,6 +358,17 @@ public class Gemma3TextModel: Module, LLMModel {
         return out
     }
 
+    /// Returns the post-final-RMSNorm hidden states (pre-lm_head). Useful for
+    /// downstream consumers that use Gemma 3 as a text encoder rather than as
+    /// a language model — for example, multimodal pipelines that feed Gemma's
+    /// hidden states into a connector / cross-attention module.
+    ///
+    /// Equivalent to the inner `Gemma3Model.__call__` in mlx-lm Python:
+    /// `model.language_model.model(input_ids)`.
+    public func hiddenStates(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        return model(inputs, mask: nil, cache: cache)
+    }
+
     public func sanitize(weights: [String: MLXArray])
         -> [String: MLXArray]
     {
