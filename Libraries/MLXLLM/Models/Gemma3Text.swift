@@ -311,6 +311,25 @@ public class Gemma3Model: Module {
     )
         -> MLXArray
     {
+        return callAsFunction(
+            inputs, mask: mask, slidingWindowMask: nil, cache: cache)
+    }
+
+    /// Internal entry point that allows callers (e.g. the encoder-style
+    /// `Gemma3TextModel.hiddenStates(_:attentionMask:cache:)`) to supply a
+    /// pre-built additive mask for global-attention layers, plus an optional
+    /// distinct mask for sliding-window-attention layers. When `mask` is nil
+    /// the original cache-driven `createAttentionMask` path is used (preserves
+    /// generation behaviour); when `mask` is supplied with no
+    /// `slidingWindowMask`, `mask` is reused for sliding layers.
+    func callAsFunction(
+        _ inputs: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        slidingWindowMask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        cache: [KVCache?]? = nil
+    )
+        -> MLXArray
+    {
         var h: MLXArray
         h = embedTokens(inputs)
         let scale = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
@@ -320,18 +339,27 @@ public class Gemma3Model: Module {
             layerCache = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let globalMask = createAttentionMask(h: h, cache: cache?[config.slidingWindowPattern - 1])
-        let slidingWindowMask =
-            if config.slidingWindowPattern > 1 {
-                createAttentionMask(h: h, cache: cache?[0], windowSize: config.slidingWindow)
-            } else {
-                MLXFast.ScaledDotProductAttentionMaskMode.none
-            }
+        let resolvedGlobalMask: MLXFast.ScaledDotProductAttentionMaskMode
+        let resolvedSlidingMask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let m = mask {
+            resolvedGlobalMask = m
+            resolvedSlidingMask = slidingWindowMask ?? m
+        } else {
+            resolvedGlobalMask = createAttentionMask(
+                h: h, cache: cache?[config.slidingWindowPattern - 1])
+            resolvedSlidingMask =
+                if config.slidingWindowPattern > 1 {
+                    createAttentionMask(
+                        h: h, cache: cache?[0], windowSize: config.slidingWindow)
+                } else {
+                    MLXFast.ScaledDotProductAttentionMaskMode.none
+                }
+        }
 
         for (i, layer) in layers.enumerated() {
             let isGlobal = (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
-            let mask = isGlobal ? globalMask : slidingWindowMask
-            h = layer(h, mask: mask, cache: layerCache?[i])
+            let layerMask = isGlobal ? resolvedGlobalMask : resolvedSlidingMask
+            h = layer(h, mask: layerMask, cache: layerCache?[i])
         }
         return norm(h)
     }
@@ -367,6 +395,88 @@ public class Gemma3TextModel: Module, LLMModel {
     /// `model.language_model.model(input_ids)`.
     public func hiddenStates(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         return model(inputs, mask: nil, cache: cache)
+    }
+
+    /// Encoder-style hidden-state extraction with a key-padding-aware
+    /// attention mask. Required when the consumer feeds left-padded input
+    /// (e.g. LTX-Video / Dramabox 1024-token Gemma encoder) and needs valid
+    /// tokens to ignore pad keys at every layer. Pass a `[B, T]` integer
+    /// `attentionMask` (1 = valid, 0 = pad); a combined causal + key-padding
+    /// additive mask is built per `mlx-lm`'s reference helper. When the
+    /// model has a sliding-window pattern, a windowed variant is built and
+    /// applied to sliding layers; the global mask is applied to global
+    /// layers (matches the Python `_build_combined_mask` in
+    /// `transformers.Gemma3TextModel`).
+    ///
+    /// `attentionMask == nil` is equivalent to `hiddenStates(_:cache:)`.
+    public func hiddenStates(
+        _ inputs: MLXArray,
+        attentionMask: MLXArray?,
+        cache: [KVCache]? = nil
+    ) -> MLXArray {
+        guard let attn = attentionMask else {
+            return model(inputs, mask: nil, cache: cache)
+        }
+
+        // Build the embedding-multiplied hidden state once just to recover the
+        // working dtype for the additive mask. Cheaper than threading dtype.
+        let dtype = model.embedTokens(inputs[0..<1, 0..<1]).dtype
+
+        let global = Self.buildCombinedAdditiveMask(
+            attentionMask: attn, dtype: dtype, windowSize: nil)
+        let sliding: MLXFast.ScaledDotProductAttentionMaskMode? =
+            config.slidingWindowPattern > 1
+            ? .array(Self.buildCombinedAdditiveMaskArray(
+                attentionMask: attn, dtype: dtype, windowSize: config.slidingWindow))
+            : nil
+        return model(
+            inputs, mask: .array(global), slidingWindowMask: sliding, cache: cache)
+    }
+
+    /// Builds an additive `[1, 1, T, T]` mask (in the supplied dtype) that
+    /// combines a strict-lower-triangular causal mask with a key-padding mask
+    /// derived from `attentionMask` (`[B, T]`, 1 = valid, 0 = pad). Allowed
+    /// positions are 0; disallowed positions are dtype-min (≈ -infinity).
+    /// Optional `windowSize` clamps the causal cone to the last `windowSize`
+    /// keys (used for sliding-window layers).
+    static func buildCombinedAdditiveMask(
+        attentionMask: MLXArray, dtype: DType, windowSize: Int?
+    ) -> MLXArray {
+        return buildCombinedAdditiveMaskArray(
+            attentionMask: attentionMask, dtype: dtype, windowSize: windowSize)
+    }
+
+    static func buildCombinedAdditiveMaskArray(
+        attentionMask: MLXArray, dtype: DType, windowSize: Int?
+    ) -> MLXArray {
+        // attentionMask: [B, T]; 1 = valid, 0 = pad.
+        let T = attentionMask.dim(1)
+        let rows = MLXArray.arange(T).reshaped(T, 1)
+        let cols = MLXArray.arange(T).reshaped(1, T)
+        var allowed = rows .>= cols  // [T, T] bool
+        if let w = windowSize {
+            allowed = allowed .&& ((rows - cols) .< w)
+        }
+        // Broadcast to [1, 1, T, T]
+        let causal4D = allowed.reshaped(1, 1, T, T)
+        // [B, 1, 1, T] key-padding mask
+        let keepKeys = (attentionMask .!= 0).reshaped(
+            attentionMask.dim(0), 1, 1, T)
+        let combined = causal4D .&& keepKeys  // bool [B, 1, T, T]
+        // Cast to additive: 0 where allowed, dtype.min where not.
+        let zero = MLXArray(0).asType(dtype)
+        let negInf = MLXArray(Self.dtypeMin(dtype)).asType(dtype)
+        return which(combined, zero, negInf)
+    }
+
+    /// dtype-min sentinel for additive attention masks. fp16 / bf16 use a
+    /// finite "-infinity-equivalent" so SDPA softmax stays numerically stable.
+    private static func dtypeMin(_ dtype: DType) -> Float {
+        switch dtype {
+        case .float16: return -65504.0  // fp16 finite min
+        case .bfloat16: return -3.38953e38  // bf16 finite min (1.0 * 2^127 with sign)
+        default: return -Float.greatestFiniteMagnitude
+        }
     }
 
     public func sanitize(weights: [String: MLXArray])
