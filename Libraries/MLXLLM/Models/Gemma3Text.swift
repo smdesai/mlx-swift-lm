@@ -363,6 +363,69 @@ public class Gemma3Model: Module {
         }
         return norm(h)
     }
+
+    /// Variant of `callAsFunction(_:mask:slidingWindowMask:cache:)` that
+    /// returns the per-layer hidden-state stack as a list of length
+    /// `num_layers + 1`. Mirrors the Python `transformers
+    /// Gemma3TextModel.forward(output_hidden_states=True)` /
+    /// `mlx-lm`'s `_collect_hidden_states` helper.
+    ///
+    /// Returned list:
+    ///   - index 0:        post-embedding hidden state (`embed * sqrt(d)`)
+    ///   - index `1..<L`:  hidden state AFTER block `i-1`
+    ///   - index `L`:      `norm(post-block-(L-1))` (same as the
+    ///                     non-stacking path's return value)
+    /// where `L = num_layers`. Total length: `num_layers + 1`.
+    func hiddenStatesStack(
+        _ inputs: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        slidingWindowMask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        cache: [KVCache?]? = nil
+    )
+        -> [MLXArray]
+    {
+        var h: MLXArray
+        h = embedTokens(inputs)
+        let scale = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
+        h = h * scale.asType(h.dtype)
+        var layerCache = cache
+        if layerCache == nil {
+            layerCache = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+
+        let resolvedGlobalMask: MLXFast.ScaledDotProductAttentionMaskMode
+        let resolvedSlidingMask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let m = mask {
+            resolvedGlobalMask = m
+            resolvedSlidingMask = slidingWindowMask ?? m
+        } else {
+            resolvedGlobalMask = createAttentionMask(
+                h: h, cache: cache?[config.slidingWindowPattern - 1])
+            resolvedSlidingMask =
+                if config.slidingWindowPattern > 1 {
+                    createAttentionMask(
+                        h: h, cache: cache?[0], windowSize: config.slidingWindow)
+                } else {
+                    MLXFast.ScaledDotProductAttentionMaskMode.none
+                }
+        }
+
+        var hiddenStates: [MLXArray] = []
+        hiddenStates.reserveCapacity(layers.count + 1)
+        for (i, layer) in layers.enumerated() {
+            // Capture state BEFORE the layer call (matches the Python
+            // `hidden_states.append(h)` semantics in
+            // `_collect_hidden_states`).
+            hiddenStates.append(h)
+            let isGlobal = (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
+            let layerMask = isGlobal ? resolvedGlobalMask : resolvedSlidingMask
+            h = layer(h, mask: layerMask, cache: layerCache?[i])
+        }
+        // Final entry: norm(post-block-(L-1)). Matches the non-stacking
+        // path's return value and the Python `hidden_states[-1]`.
+        hiddenStates.append(norm(h))
+        return hiddenStates
+    }
 }
 
 public class Gemma3TextModel: Module, LLMModel {
@@ -431,6 +494,47 @@ public class Gemma3TextModel: Module, LLMModel {
             : nil
         return model(
             inputs, mask: .array(global), slidingWindowMask: sliding, cache: cache)
+    }
+
+    /// Encoder-style hidden-state STACK extraction. Returns the per-layer
+    /// hidden states packed as `[B, T, D, L]`, where `L = num_layers + 1`.
+    ///
+    /// The stack contents (matches Python `transformers
+    /// Gemma3TextModel.forward(output_hidden_states=True)`):
+    ///   - layer `0`:        post-embedding hidden state (`embed * sqrt(d)`)
+    ///   - layers `1..<L-1`: hidden state AFTER the corresponding transformer block
+    ///   - layer `L-1`:      `norm(post-block-(num_layers-1))` — same as
+    ///                       the single-layer `hiddenStates(_:attentionMask:cache:)` return
+    ///
+    /// Required by multimodal pipelines (LTX-Video / Dramabox) whose
+    /// connectors consume the full per-layer stack rather than just the
+    /// final layer. Pass `attentionMask=nil` for the unmasked (causal-
+    /// only) path; pass a `[B, T]` integer 0/1 mask for the
+    /// padding-aware path used by the Dramabox 1024-token encoder.
+    public func hiddenStatesStack(
+        _ inputs: MLXArray,
+        attentionMask: MLXArray?,
+        cache: [KVCache]? = nil
+    ) -> MLXArray {
+        let layers: [MLXArray]
+        if let attn = attentionMask {
+            let dtype = model.embedTokens(inputs[0..<1, 0..<1]).dtype
+            let global = Self.buildCombinedAdditiveMask(
+                attentionMask: attn, dtype: dtype, windowSize: nil)
+            let sliding: MLXFast.ScaledDotProductAttentionMaskMode? =
+                config.slidingWindowPattern > 1
+                ? .array(Self.buildCombinedAdditiveMaskArray(
+                    attentionMask: attn, dtype: dtype, windowSize: config.slidingWindow))
+                : nil
+            layers = model.hiddenStatesStack(
+                inputs, mask: .array(global), slidingWindowMask: sliding, cache: cache)
+        } else {
+            layers = model.hiddenStatesStack(
+                inputs, mask: nil, slidingWindowMask: nil, cache: cache)
+        }
+        // Stack on a new last axis: each entry is [B, T, D]; result is
+        // [B, T, D, L] matching the Dramabox connector contract.
+        return MLX.stacked(layers, axis: -1)
     }
 
     /// Builds an additive `[1, 1, T, T]` mask (in the supplied dtype) that
