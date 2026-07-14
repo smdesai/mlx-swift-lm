@@ -28,6 +28,7 @@ MODEL_TYPES=(
     gemma2
     gemma3_text
     gemma3n
+    gemma4
     qwen2
     qwen3
     granite
@@ -56,6 +57,7 @@ MODEL_IDS=(
     "mlx-community/gemma-2-2b-it-4bit"
     "mlx-community/gemma-3-1b-it-qat-4bit"
     "mlx-community/gemma-3n-E2B-it-lm-4bit"
+    "mlx-community/gemma-4-e2b-it-4bit"
     "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
     "mlx-community/Qwen3-0.6B-4bit"
     "mlx-community/granite-3.3-2b-instruct-4bit"

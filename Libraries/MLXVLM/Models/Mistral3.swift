@@ -83,7 +83,7 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     public var vocabSize: Int { _vocabSize ?? 32000 }
     public var spatialMergeSize: Int { _spatialMergeSize ?? 2 }
     public var multimodalProjectorBias: Bool { _multimodalProjectorBias ?? false }
-    public var eosTokenId: [Int]? { _eosTokenId }
+    public var eosTokenId: [Int]? { _eosTokenId?.values }
 
     private let _ignoreIndex: Int?
     private let _imageTokenIndex: Int?
@@ -93,7 +93,7 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     private let _vocabSize: Int?
     private let _spatialMergeSize: Int?
     private let _multimodalProjectorBias: Bool?
-    private let _eosTokenId: [Int]?
+    private let _eosTokenId: IntOrIntArray?
 
     enum CodingKeys: String, CodingKey {
         case textConfig = "text_config"
@@ -304,6 +304,9 @@ private enum Language {
         @ModuleInfo(key: "v_proj") var wv: Linear
         @ModuleInfo(key: "o_proj") var wo: Linear
 
+        @ModuleInfo(key: "q_norm") var qNorm: RMSNorm?
+        @ModuleInfo(key: "k_norm") var kNorm: RMSNorm?
+
         let rope: RoPELayer
 
         init(_ config: Mistral3VLMTextConfiguration) {
@@ -320,6 +323,13 @@ private enum Language {
             self._wk.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
             self._wv.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
             self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
+
+            if config.useQkNorm {
+                self._qNorm.wrappedValue = RMSNorm(
+                    dimensions: headDim, eps: config.rmsNormEps)
+                self._kNorm.wrappedValue = RMSNorm(
+                    dimensions: headDim, eps: config.rmsNormEps)
+            }
 
             // Initialize RoPE using rope_parameters - rope_theta is required like in Python
             guard let ropeParams = config.ropeParameters,
@@ -348,8 +358,16 @@ private enum Language {
             var keys = wk(x)
             var values = wv(x)
 
-            queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
-            keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            queries = queries.reshaped(B, L, nHeads, -1)
+            keys = keys.reshaped(B, L, nKVHeads, -1)
+
+            if let qNorm, let kNorm {
+                queries = qNorm(queries)
+                keys = kNorm(keys)
+            }
+
+            queries = queries.transposed(0, 2, 1, 3)
+            keys = keys.transposed(0, 2, 1, 3)
             values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0

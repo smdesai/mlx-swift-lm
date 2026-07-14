@@ -926,7 +926,9 @@ public struct NemotronHConfiguration: Codable, Sendable {
             // time_step_limit as array [min, max]
             timeStepLimitMin = limits[0]
             timeStepLimitMax = limits.count > 1 ? limits[1] : limits[0]
-        } else if let limitMin = try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) {
+        } else if let limitMin = try container.decodeIfPresent(
+            Float.self, forKey: .timeStepLimitMin)
+        {
             timeStepLimitMin = limitMin
             timeStepLimitMax =
                 try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMax)
