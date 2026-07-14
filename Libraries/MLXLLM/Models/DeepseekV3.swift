@@ -197,8 +197,9 @@ class DeepseekV3Attention: Module {
 
         var (kNope, values) = (splitKv[0], splitKv[1])
 
-        qPe = applyRotaryPosition(rope, to: qPe, cache: cache)
-        kPe = applyRotaryPosition(rope, to: kPe, cache: cache)
+        let offset = cache?.ropeOffset
+        qPe = applyRotaryPosition(rope, to: qPe, offset: offset)
+        kPe = applyRotaryPosition(rope, to: kPe, offset: offset)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
         var keys: MLXArray
@@ -329,7 +330,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
         var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        y = weightedExpertSum(y, scores)
 
         if let shared = sharedExperts {
             y = y + shared(x)
@@ -420,7 +421,7 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public var model: DeepseekV3ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    init(_ args: DeepseekV3Configuration) {
+    public init(_ args: DeepseekV3Configuration) {
         self.args = args
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
