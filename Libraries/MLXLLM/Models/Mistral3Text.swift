@@ -323,9 +323,8 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         // Handle tied embeddings
-        if args.tieWordEmbeddings {
-            sanitizedWeights["lm_head.weight"] = nil
-        }
+        sanitizedWeights = filterLMHeadWeights(
+            from: sanitizedWeights, tiedWordEmbeddings: args.tieWordEmbeddings)
 
         // Handle weight_scale_inv for quantized weights
         var newWeights: [String: MLXArray] = [:]
@@ -348,15 +347,14 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     /// Create appropriate caches for each layer type.
     ///
-    /// Sliding window attention layers use RotatingKVCache,
-    /// full attention layers use standard KVCacheSimple.
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.map { layer in
-            if layer.useSliding, let slidingWindow = args.slidingWindow {
-                return RotatingKVCache(maxSize: slidingWindow)
-            } else {
-                return KVCacheSimple()
-            }
+    /// Sliding-window layers use the smaller of the architecture window and
+    /// `GenerateParameters.maxKVSize`; full-attention layers use the requested limit.
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try model.layers.map { layer in
+            try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: args.slidingWindow,
+                usesSlidingWindow: layer.useSliding)
         }
     }
 }
@@ -491,4 +489,10 @@ extension Mistral3TextModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension Mistral3TextModel {
+    public var toolCallFormat: ToolCallFormat? { .mistral }
 }

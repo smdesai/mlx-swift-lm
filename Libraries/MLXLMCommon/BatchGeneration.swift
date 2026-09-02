@@ -197,7 +197,7 @@ public class BatchGenerator {
         prompts: [[Int]],
         maxTokens: [Int]? = nil,
         caches: [[KVCache]]? = nil
-    ) -> [Int] {
+    ) throws -> [Int] {
         var uids: [Int] = []
 
         let maxToks = maxTokens ?? Array(repeating: self.maxTokens, count: prompts.count)
@@ -205,7 +205,7 @@ public class BatchGenerator {
 
         // Create default caches if not provided
         for i in 0 ..< promptCaches.count where promptCaches[i].isEmpty {
-            promptCaches[i] = model.newCache(parameters: nil)
+            promptCaches[i] = try model.newCache(parameters: nil)
         }
 
         for i in 0 ..< prompts.count {
@@ -278,9 +278,9 @@ public class BatchGenerator {
         }
     }
 
-    private func makeBatchCache(leftPadding: [Int]) -> [KVCache] {
+    private func makeBatchCache(leftPadding: [Int]) throws -> [KVCache] {
         // Create batch caches based on model's cache type
-        let sampleCache = model.newCache(parameters: nil)
+        let sampleCache = try model.newCache(parameters: nil)
 
         return sampleCache.enumerated().map { (i, cache) -> KVCache in
             makeBatchCacheEntry(cache, layerId: i, leftPadding: leftPadding)
@@ -289,7 +289,7 @@ public class BatchGenerator {
 
     private func processPrompts(
         _ prompts: [(uid: Int, tokens: [Int], maxTokens: Int, cache: [KVCache])]
-    ) -> Batch {
+    ) throws -> Batch {
         let uids = prompts.map { $0.uid }
         let inputs = prompts.map { $0.tokens }
         let maxTokens = prompts.map { $0.maxTokens }
@@ -310,7 +310,7 @@ public class BatchGenerator {
         // New prompts - left-pad inputs
         if maxCacheLength == 0 {
             inputTokens = leftPadPrompts(inputs, maxLength: maxLength)
-            promptCache = makeBatchCache(leftPadding: padding)
+            promptCache = try makeBatchCache(leftPadding: padding)
 
             // Process ALL prompt tokens in prefill (matching non-batch behavior)
             // This processes all tokens in a single pass (or chunked passes for long prompts)
@@ -495,7 +495,7 @@ public class BatchGenerator {
     }
 
     /// Generate next token for all active sequences
-    public func next() -> [Response] {
+    public func next() throws -> [Response] {
         let tic = Date()
 
         var promptProcessing = false
@@ -519,7 +519,7 @@ public class BatchGenerator {
                 stats.generationTime += Date().timeIntervalSince(tic)
             }
 
-            let newBatch = processPrompts(prompts)
+            let newBatch = try processPrompts(prompts)
             unprocessedPrompts.removeFirst(min(prefillBatchSize, unprocessedPrompts.count))
             promptProcessing = true
 
@@ -640,7 +640,7 @@ public func batchGenerate(
     sampler: LogitSampler? = nil,
     returnPromptCaches: Bool = false,
     verbose: Bool = false
-) -> BatchResponse {
+) throws -> BatchResponse {
     let stopTokens = Set([tokenizer.eosTokenId].compactMap { $0 })
 
     let generator = BatchGenerator(
@@ -657,12 +657,12 @@ public func batchGenerate(
         print("[batch_generate] Finished processing 0/\(numSamples) ...", terminator: "\r")
     }
 
-    let uids = generator.insert(prompts: prompts, caches: promptCaches)
+    let uids = try generator.insert(prompts: prompts, caches: promptCaches)
     var results: [Int: [Int]] = Dictionary(uniqueKeysWithValues: uids.map { ($0, []) })
     var caches: [Int: [KVCache]] = [:]
 
     while true {
-        let responses = generator.next()
+        let responses = try generator.next()
         if responses.isEmpty { break }
 
         for r in responses {

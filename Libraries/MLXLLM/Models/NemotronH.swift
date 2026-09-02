@@ -739,15 +739,15 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         return out
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         let pattern = Array(configuration.hybridOverridePattern)
-        return pattern.compactMap { char -> KVCache? in
+        return try pattern.compactMap { char -> KVCache? in
             let blockType = NemotronHBlockType(from: char)
             switch blockType {
             case .mamba:
                 return MambaCache()
             case .attention:
-                return KVCacheSimple()
+                return try makeAttentionKVCache(parameters: parameters)
             case .mlp, .moe:
                 return nil  // No cache needed for MLP/MoE layers
             }
@@ -757,7 +757,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
 
-        for (key, value) in weights {
+        for (key, value) in filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
+        {
             var finalValue = value
 
             // Handle conv1d weight axis swap
@@ -1019,4 +1021,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.timeStepLimitMin = timeStepLimitMin
         self.timeStepLimitMax = timeStepLimitMax
     }
+}
+
+// MARK: - Chat conventions
+
+extension NemotronHModel {
+    public var toolCallFormat: ToolCallFormat? { .xmlFunction }
 }

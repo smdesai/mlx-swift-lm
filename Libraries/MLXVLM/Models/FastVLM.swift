@@ -1128,7 +1128,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -1137,19 +1137,15 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: input.image?.pixels,
             mask: input.text.mask
         )
-        let prefillStepSize = windowSize ?? 512
         let totalPositions = embeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(nil, cache: cache, inputEmbedding: embeddings[0..., range, 0...])
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let result = languageModel(
             nil, cache: cache, inputEmbedding: embeddings[0..., processed..., 0...])
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
     }
 
@@ -1162,7 +1158,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         // Not sure we need to replicate the full Python logic since the weights were transformed on conversion
 
         var sanitizedWeights: [String: MLXArray] = [:]
-        for (k, v) in weights {
+        for (k, v) in filterLMHeadWeights(
+            from: weights,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+        {
             var key = k
             if key.contains("mm_projector") {
                 key = key.replacingOccurrences(of: "mm_projector", with: "mm_projector.layers")

@@ -116,7 +116,7 @@ struct BatchGenerate: AsyncParsableCommand {
         // don't produce correct output in batch mode due to left-padding offset
         // issues in mixed KVCacheSimple + RotatingKVCache setups.
         // Fall back to sequential single-prompt generation for these models.
-        let sampleCache = context.model.newCache(parameters: nil)
+        let sampleCache = try context.model.newCache(parameters: nil)
         let hasRotatingCaches = sampleCache.contains { $0 is RotatingKVCache }
 
         if prompts.count == 1 || hasRotatingCaches {
@@ -189,7 +189,7 @@ struct BatchGenerate: AsyncParsableCommand {
                         "Peak memory: \(String(format: "%.2f", Double(Memory.peakMemory) / 1e9)) GB"
                     )
                 }
-            case .toolCall:
+            case .toolCall, .rejectedToolCall:
                 break
             }
         }
@@ -237,7 +237,7 @@ struct BatchGenerate: AsyncParsableCommand {
         // - CacheList wraps MambaCache + KVCacheSimple per layer (e.g. FalconH1)
         // - RotatingKVCache (sliding window models like Gemma3) can't be merged by
         //   mergeCaches() — it discards pre-filled content, causing shape mismatches
-        let sampleCache = context.model.newCache(parameters: nil)
+        let sampleCache = try context.model.newCache(parameters: nil)
         let hasHybridCaches = sampleCache.contains { $0 is MambaCache || $0 is CacheList }
         let hasRotatingCaches = sampleCache.contains { $0 is RotatingKVCache }
 
@@ -283,7 +283,7 @@ struct BatchGenerate: AsyncParsableCommand {
 
                 if prefixValid {
                     // C) Pre-fill a single KV cache with system tokens
-                    let singleCache = context.model.newCache(parameters: nil)
+                    let singleCache = try context.model.newCache(parameters: nil)
                     let sysTensor = MLXArray(systemTokens.map { Int32($0) })
                         .reshaped([1, systemTokenCount])
                     let _ = context.model(
@@ -293,7 +293,7 @@ struct BatchGenerate: AsyncParsableCommand {
                     // D) Clone N times via copy-on-write state assignment
                     var clones: [[KVCache]] = []
                     for _ in 0 ..< allTokens.count {
-                        var clonedCache = context.model.newCache(parameters: nil)
+                        var clonedCache = try context.model.newCache(parameters: nil)
                         for layerIdx in 0 ..< singleCache.count {
                             clonedCache[layerIdx].state = singleCache[layerIdx].state
                         }
@@ -333,9 +333,9 @@ struct BatchGenerate: AsyncParsableCommand {
         // Insert with pre-filled caches if available, otherwise use full tokens
         let uids: [Int]
         if let suffixes = suffixTokens, let caches = prefillCaches {
-            uids = generator.insert(prompts: suffixes, caches: caches)
+            uids = try generator.insert(prompts: suffixes, caches: caches)
         } else {
-            uids = generator.insert(prompts: allTokens)
+            uids = try generator.insert(prompts: allTokens)
         }
 
         // Generate all tokens
@@ -344,7 +344,7 @@ struct BatchGenerate: AsyncParsableCommand {
 
         printErr("[batch_generate] Finished processing 0/\(prompts.count) ...")
         while true {
-            let responses = generator.next()
+            let responses = try generator.next()
             if responses.isEmpty { break }
 
             for r in responses {

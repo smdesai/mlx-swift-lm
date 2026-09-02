@@ -317,9 +317,8 @@ public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = weights
 
-        if configuration.tieWordEmbeddings {
-            sanitized["lm_head.weight"] = nil
-        }
+        sanitized = filterLMHeadWeights(
+            from: sanitized, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         for l in 0 ..< configuration.hiddenLayers {
             let prefix = "model.layers.\(l)"
@@ -446,4 +445,10 @@ extension GLM4MoEModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension GLM4MoEModel {
+    public var toolCallFormat: ToolCallFormat? { .glm4 }
 }

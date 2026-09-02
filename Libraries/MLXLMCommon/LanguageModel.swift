@@ -17,6 +17,26 @@ public protocol BaseLanguageModel: Module {
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
 }
 
+/// Weight files a model needs that no naming convention or `model.safetensors.index.json`
+/// selects.
+///
+/// A checkpoint can ship weights in a file that neither the conventional `model*.safetensors`
+/// names nor its own index cover: `jinaai/jina-reranker-v3-mlx` keeps its reranking head in
+/// `projector.safetensors` and maps only the transformer shards in its index, so the head is
+/// never read and the model fails to load. The reference implementation has the same gap and
+/// closes it the same way -- the checkpoint's `rerank.py` loads that file by name.
+///
+/// Conform a model to this protocol to name those files. Being explicit rather than widening
+/// the selection is what keeps unrelated weights out: a stray tensor whose name a model's
+/// `sanitize(weights:)` rewrites is loaded silently rather than reported.
+public protocol AdditionalWeightFilesProviding {
+    /// File names, relative to the model directory.
+    ///
+    /// They are loaded after the selected weight files, so a file that is already selected is
+    /// not loaded twice, and names that are not present are ignored.
+    var additionalWeightFiles: [String] { get }
+}
+
 /// Optional metadata a model wants written into converted safetensors.
 ///
 /// Model-specific metadata lets future loaders distinguish transformed MLX-native
@@ -34,6 +54,23 @@ extension BaseLanguageModel {
         MLXArray]
     {
         sanitize(weights: weights)
+    }
+}
+
+/// Removes checkpoint tensors owned by an `lm_head` module when the model uses its token
+/// embedding as the output projection instead.
+///
+/// Quantized linear layers carry parameters in addition to `weight` (for example `scales`
+/// and `biases`). Filtering by the module path keeps those parameters from being loaded into
+/// the absent head. Matching a complete path component also supports weights that have already
+/// been namespaced by a wrapper model without affecting similarly named modules.
+package func filterLMHeadWeights(
+    from weights: [String: MLXArray], tiedWordEmbeddings: Bool
+) -> [String: MLXArray] {
+    guard tiedWordEmbeddings else { return weights }
+
+    return weights.filter { key, _ in
+        !key.split(separator: ".").contains("lm_head")
     }
 }
 
@@ -104,6 +141,13 @@ public struct LMInput {
             }
             guard tokens.ndim == 2 else { return nil }
             return Array(repeating: tokens.dim(1), count: tokens.dim(0))
+        }
+
+        /// Number of logical sequence positions consumed by one model call.
+        /// Batch dimensions do not duplicate the shared cache timeline.
+        @inline(__always)
+        package var cacheSequenceLength: Int {
+            tokens.ndim == 0 ? 0 : tokens.dim(-1)
         }
     }
 
@@ -202,12 +246,39 @@ public struct LMOutput {
             self.contents = [:]
         }
 
+        init(serializedArrays: [String: MLXArray]) {
+            self.contents = serializedArrays.mapValues { $0 as Any }
+        }
+
+        func serializedArrays() throws -> [String: MLXArray] {
+            var arrays: [String: MLXArray] = [:]
+            for (key, value) in contents {
+                guard let array = value as? MLXArray else {
+                    throw SerializationError.unsupportedValue(
+                        key: key, type: String(describing: type(of: value)))
+                }
+                arrays[key] = array
+            }
+            return arrays
+        }
+
         public subscript<T>(_ key: Key<T>) -> T? {
             get {
                 contents[key.id] as? T
             }
             set {
                 contents[key.id] = newValue
+            }
+        }
+
+        enum SerializationError: LocalizedError {
+            case unsupportedValue(key: String, type: String)
+
+            var errorDescription: String? {
+                switch self {
+                case .unsupportedValue(let key, let type):
+                    "LMOutput.State key '\(key)' contains unsupported value type '\(type)'"
+                }
             }
         }
     }
@@ -218,7 +289,7 @@ public struct LMOutput {
     }
 }
 
-/// The result of the call to ``LanguageModel/prepare(_:cache:state:windowSize:)``
+/// The result of the call to ``LanguageModel/prepare(_:cache:state:prefill:)``
 public enum PrepareResult {
     /// tokens to process by the ``TokenIterator``
     case tokens(LMInput.Text)
@@ -232,10 +303,18 @@ public enum PrepareResult {
 /// The language model is typically called by the ``TokenIterator`` and it:
 ///
 /// - consumes the ``LMInput``
-/// - calls ``prepare(_:cache:state:windowSize:)`` to initialize the KVCache and consume the prompt
+/// - calls ``prepare(_:cache:state:prefill:)`` to initialize the KVCache and consume the prompt
 /// - calls ``callAsFunction(_:cache:state:)-9kuvf`` for each token, producing an ``LMOutput``
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
-public protocol LanguageModel: BaseLanguageModel {
+public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
+
+    /// Build derived state after checkpoint or adapter topology updates and
+    /// before the model is used for inference.
+    ///
+    /// Implementations may materialize arrays or replace storage-sharing
+    /// module views. The library invokes this lifecycle hook while it has
+    /// exclusive access to the model; inference calls must remain read-only.
+    func prepare() throws
 
     /// Prepare the cache state and consume the ``LMInput``.
     ///
@@ -250,7 +329,17 @@ public protocol LanguageModel: BaseLanguageModel {
     /// This can return:
     /// - ``PrepareResult/tokens(_:)`` if the caller should evaluate the (remaining) tokens normally
     /// - ``PrepareResult/logits(_:)`` to produce the next token from the prompt
-    func prepare(_ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int?)
+    ///
+    /// Implementations that chunk the prompt should drive the loop with
+    /// ``PrefillParameters/forEachChunk(total:reserving:defaultStepSize:maximumStepSize:_:)``,
+    /// which owns cancellation, pooling, and per-chunk progress. An
+    /// implementation returning `.logits` owns its whole
+    /// ``PrefillParameters/progress`` sequence, including the terminal
+    /// `(total, total)`; one returning `.tokens` reports only its own chunks —
+    /// the iterator that evaluates the remainder completes the sequence.
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    )
         throws -> PrepareResult
 
     /// Primary entry point to produce a step (single token) from the model
@@ -260,12 +349,46 @@ public protocol LanguageModel: BaseLanguageModel {
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
 
-    /// create a new array of ``KVCache``: automatic implementation if self
-    /// implements ``KVCacheDimensionProvider``
-    func newCache(parameters: GenerateParameters?) -> [KVCache]
+    /// Create a new array of ``KVCache`` appropriate for this model.
+    ///
+    /// Implementations must honor ``GenerateParameters/maxKVSize`` for any
+    /// attention layer that can be token-windowed. Hybrid attention / state-space
+    /// models apply the limit to attention caches only (see
+    /// ``makeAttentionKVCache(parameters:)``).
+    ///
+    /// - Throws: ``KVCacheConfigurationError`` when the request or a model-defined
+    ///   cache size is invalid.
+    ///
+    /// Automatic implementation if self implements ``KVCacheDimensionProvider``.
+    func newCache(parameters: GenerateParameters?) throws -> [KVCache]
+
+    /// Authoritative planned status of the cache ``newCache(parameters:)`` produces.
+    ///
+    /// Use this from ``ModelContainer`` / ``ChatSession`` (or directly on the model)
+    /// to inspect topology, requested capacity, and strategy compatibility without
+    /// allocating or casting probe caches in application code.
+    ///
+    /// The default implementation derives the description from ``newCache(parameters:)``.
+    /// Models may override with a zero-allocation declarative path, but must stay
+    /// consistent with ``newCache(parameters:)``.
+    func cacheStatus(parameters: GenerateParameters?) throws -> KVCacheStatus
 }
 
 extension LanguageModel {
+    /// Most language models have no derived inference state to prepare.
+    public func prepare() throws {}
+
+    @available(
+        *, deprecated, renamed: "prepare(_:cache:state:prefill:)",
+        message:
+            "prefill now defaults to balanced chunking; use prefill.chunking = .remainder for the legacy chunk boundaries"
+    )
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int?
+    ) throws -> PrepareResult {
+        try prepare(input, cache: cache, state: state, prefill: .init(stepSize: windowSize))
+    }
+
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
     {
@@ -276,6 +399,19 @@ extension LanguageModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
     }
+
+    /// Default: classify the caches that ``newCache(parameters:)`` constructs.
+    ///
+    /// Empty caches allocate negligible state (no tensors until the first update),
+    /// so this is always consistent with the runtime path. Prefer a declarative
+    /// override only when construction itself is expensive.
+    public func cacheStatus(parameters: GenerateParameters?) throws -> KVCacheStatus {
+        let plan = try parameters?.kvCachePlan() ?? .disabled
+        return KVCacheStatus(
+            cache: try newCache(parameters: parameters),
+            plan: plan,
+            phase: .planned)
+    }
 }
 
 /// Optional protocol that can be implemented by ``LanguageModel`` and will
@@ -285,18 +421,17 @@ public protocol KVCacheDimensionProvider {
 }
 
 extension LanguageModel where Self: KVCacheDimensionProvider {
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         // Create one cache per layer (kvHeads.count = number of layers)
         // The number of heads per layer (kvHeads[i]) is not used for cache creation
         let numLayers = kvHeads.count
-
-        // Follow Python logic: use RotatingKVCache if maxKVSize is provided
-        if let maxKVSize = parameters?.maxKVSize {
-            return (0 ..< numLayers).map { _ in
-                RotatingKVCache(maxSize: maxKVSize, keep: 4)
-            }
-        } else {
-            return (0 ..< numLayers).map { _ in KVCacheSimple() }
+        return try (0 ..< numLayers).map { _ in
+            try makeAttentionKVCache(parameters: parameters)
         }
     }
+
+    // Note: do not specialize ``cacheStatus(parameters:)`` here. Hybrid models
+    // commonly conform to ``KVCacheDimensionProvider`` while overriding ``newCache``;
+    // a kvHeads-based default would mis-report those layouts. The base
+    // ``LanguageModel`` implementation classifies the caches ``newCache`` builds.
 }

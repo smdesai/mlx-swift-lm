@@ -65,6 +65,13 @@ public protocol KVCache: Evaluatable {
     /// whether this cache can be trimmed
     var isTrimmable: Bool { get }
 
+    /// Predict whether this cache can still be trimmed after appending `positions`.
+    ///
+    /// - Parameter positions: The nonnegative number of sequence positions that
+    ///   would be appended.
+    /// - Returns: `true` when a subsequent rewind would remain valid.
+    func isTrimmable(after positions: Int) -> Bool
+
     /// trim n tokens from the cache, returning actual number trimmed
     @discardableResult
     func trim(_ n: Int) -> Int
@@ -99,6 +106,10 @@ public protocol KVCache: Evaluatable {
 extension KVCache {
     public var ropeOffset: RoPEOffset {
         .scalar(offset)
+    }
+
+    public func isTrimmable(after positions: Int) -> Bool {
+        isTrimmable
     }
 
     public func prepare(lengths: [Int]?) {}
@@ -169,10 +180,31 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
+/// Protocol for caches that can update and compute attention from their own storage layout.
+///
+/// Used by compressed caches such as ``VarianceNormalizedKVCache`` that keep completed
+/// tiles in a non-materialized representation and compute scores/values via cache-native
+/// kernels (e.g. `quantizedMM` in a rotated domain).
+public protocol KVCacheAttentionProtocol: KVCache {
+    /// Update the cache with new K/V tensors and compute attention without first returning a
+    /// fully materialized cache tensor pair.
+    func updateAndAttend(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
+
+    /// RoPE offset for this cache. `open` so subclasses can return a non-scalar
+    /// offset (e.g. a batched cache's per-row `.batch(...)`).
+    open var ropeOffset: RoPEOffset { .scalar(offset) }
 
     public func innerState() -> [MLXArray] { [] }
 
@@ -199,6 +231,10 @@ open class BaseKVCache: KVCache {
     }
 
     open var isTrimmable: Bool { false }
+
+    open func isTrimmable(after positions: Int) -> Bool {
+        isTrimmable
+    }
 
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
@@ -557,10 +593,13 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return trimmed
     }
 
-    /// Convert to quantized cache for maximum efficiency
+    /// Convert to a quantized cache for maximum efficiency.
     ///
     /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
+    ///
+    /// - Throws: If neither the requested group size nor another supported group size can
+    ///   represent both the key and value head dimensions.
+    public func toQuantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
         if let keys = self.keys, let values = self.values {
             // Quantize the current keys and values
             let currentKeys = keys[.ellipsis, ..<offset, 0...]
@@ -572,8 +611,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
                     valueHeadDim: currentValues.dim(3)
                 )
             else {
-                fatalError(
-                    "KV cache quantization requires head dimensions divisible by one of the supported group sizes (32, 64, 128). Requested group size: \(groupSize). Key head dim: \(currentKeys.dim(3)). Value head dim: \(currentValues.dim(3))."
+                throw KVCacheError(
+                    message:
+                        "KV cache quantization requires head dimensions divisible by one of the supported group sizes (32, 64, 128). Requested group size: \(groupSize). Key head dim: \(currentKeys.dim(3)). Value head dim: \(currentValues.dim(3))."
                 )
             }
             let quantizedCache = QuantizedKVCache(groupSize: effectiveGroupSize, bits: bits)
@@ -615,6 +655,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
 /// Rotating KV cache for sliding window attention
 public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
+    package enum CapacityOrigin: String {
+        case modelNative
+        case requested
+    }
+
     private var keep: Int
     internal var keys: MLXArray?
     internal var values: MLXArray?
@@ -622,7 +667,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// Model-native sliding-window caches deliberately keep their architectural
+    /// window and do not participate in requested-capacity validation.
+    package var capacityOrigin = CapacityOrigin.modelNative
+
+    package var preservedPrefixTokens: Int { keep }
+
     public override var maxSize: Int? { maxCacheSize }
+
+    /// Number of leading tokens that are never rotated out of the window.
+    var keepCount: Int { keep }
 
     public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
         self.maxCacheSize = maxSize
@@ -665,6 +719,58 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         } else {
             return array[.ellipsis, ..<idx, 0...]
         }
+    }
+
+    /// The trailing `tail` cache entries in chronological order, without mutating the cache.
+    ///
+    /// `update(keys:values:)` is the only other way to read a rotating cache's contents, and it
+    /// necessarily writes. This is the read-only counterpart: `keys`, `values`, `idx` and
+    /// `offset` are all left exactly as they were, so a caller can present the ring's history
+    /// alongside K/V it has not committed yet.
+    ///
+    /// The result is built by the same two steps the multi-token write path uses --
+    /// ``temporalOrder(_:)`` to linearize, then the front-trim that preserves the pinned `keep`
+    /// prefix -- so a view of length `n` holds exactly the entries a write that front-trimmed to
+    /// `n` rows would have presented. When the ring is already chronological (`idx` at the end of
+    /// the buffer, which is where every multi-token write leaves it) both steps degrade to
+    /// slices and nothing is copied.
+    ///
+    /// The pinned `keep` prefix is a floor, not just a splice point: a `tail` below it still
+    /// comes back, because those entries are not evictable and a view that dropped them would be
+    /// a context this ring can never present. With `keep == 0` -- every sliding-window model --
+    /// the floor is zero and the length is exactly `min(tail, count)`.
+    ///
+    /// - Parameter tail: Requested number of trailing entries. Clamped to what the cache holds;
+    ///   a negative value is read as zero.
+    /// - Returns: `(keys, values)` shaped `[B, kvHeads, n, headDim]` where
+    ///   `n == max(min(tail, count), min(keep, count))`, or `nil` before the first write.
+    package func logicalView(tail: Int) -> (MLXArray, MLXArray)? {
+        guard let keys = self.keys, let values = self.values else { return nil }
+
+        let orderedKeys = temporalOrder(keys)
+        let orderedValues = temporalOrder(values)
+
+        let available = orderedKeys.dim(2)
+        // Raising the bound to the pinned prefix is what keeps the front-trim's second slice in
+        // range; stated here rather than left to slice clamping, since the length it produces is
+        // the documented contract.
+        let requested = Swift.min(Swift.max(tail, 0), available)
+        let bound = Swift.max(requested, Swift.min(keep, available))
+        let trimSize = available - bound
+        guard trimSize > 0 else { return (orderedKeys, orderedValues) }
+
+        // `keep == 0` is the sliding-window case (Gemma 3/3n/4, GPT-OSS, Exaone4): no pinned
+        // prefix to splice around, so the trailing window is one slice per array.
+        if keep == 0 {
+            return (
+                orderedKeys[.ellipsis, trimSize..., 0...],
+                orderedValues[.ellipsis, trimSize..., 0...]
+            )
+        }
+        return (
+            trim(trimSize: trimSize, orderedKeys),
+            trim(trimSize: trimSize, orderedValues)
+        )
     }
 
     private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -784,11 +890,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override var metaState: [String] {
         get {
-            return [String(keep), String(maxCacheSize), String(step), String(offset), String(idx)]
+            return [
+                String(keep), String(maxCacheSize), String(step), String(offset), String(idx),
+                capacityOrigin.rawValue,
+            ]
         }
         set {
-            guard newValue.count == 5 else {
-                fatalError("RotatingKVCache metaState must have exactly 5 values")
+            guard newValue.count == 5 || newValue.count == 6 else {
+                fatalError("RotatingKVCache metaState must have 5 or 6 values")
             }
             guard let keepVal = Int(newValue[0]),
                 let stepVal = Int(newValue[2]),
@@ -810,11 +919,23 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.step = stepVal
             self.offset = offsetVal
             self.idx = idxVal
+            if newValue.count == 6 {
+                guard let origin = CapacityOrigin(rawValue: newValue[5]) else {
+                    fatalError("Invalid RotatingKVCache capacity origin '\(newValue[5])'")
+                }
+                self.capacityOrigin = origin
+            } else {
+                self.capacityOrigin = .modelNative
+            }
         }
     }
 
     public override var isTrimmable: Bool {
-        return offset < maxCacheSize
+        isTrimmable(after: 0)
+    }
+
+    public override func isTrimmable(after positions: Int) -> Bool {
+        offset + positions < maxCacheSize
     }
 
     @discardableResult
@@ -879,24 +1000,22 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
-    /// Convert to quantized cache
-    /// Note: This is complex due to the rotating nature and temporal ordering
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
-        // For now, throw an error like the Python version does
-        // A full implementation would need to handle the temporal ordering correctly
-        fatalError(
-            "RotatingKVCache quantization not yet implemented - temporal ordering makes this complex"
+    /// Convert to a quantized cache.
+    ///
+    /// Rotating-cache quantization needs a representation that preserves temporal ordering and
+    /// rotation metadata. Until that representation exists, callers can recover by retaining the
+    /// full-precision rotating cache.
+    ///
+    /// - Throws: Always, because rotating-cache quantization is not implemented.
+    public func toQuantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
+        throw KVCacheError(
+            message:
+                "RotatingKVCache quantization is not implemented because its temporal ordering requires dedicated handling."
         )
-
-        // Future implementation would need to:
-        // 1. Put keys/values in temporal order using temporalOrder()
-        // 2. Quantize the temporally ordered arrays
-        // 3. Store metadata about rotation state
-        // 4. Implement corresponding dequantization with rotation restoration
     }
 }
 
-private func resolvedKVQuantizationGroupSize(
+func resolvedKVQuantizationGroupSize(
     requested: Int,
     keyHeadDim: Int,
     valueHeadDim: Int
@@ -1319,6 +1438,9 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
     /// Per-sequence offsets (can be negative initially) [B]
     public private(set) var batchOffset: MLXArray
 
+    /// Per-row RoPE offsets. Overrides the scalar default on `BaseKVCache`.
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
+
     /// Current write index in cache
     private var idx: Int = 0
 
@@ -1574,6 +1696,9 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
 
     public var leftPadding: MLXArray
     public private(set) var batchOffset: MLXArray
+
+    /// Per-row RoPE offsets. Overrides the scalar default on `BaseKVCache`.
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
 
     private let maxCacheSize: Int
     private var idx: Int = 0
@@ -2100,8 +2225,50 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    private struct SpeculativeCheckpoint {
+        var state: [MLXArray?]
+        var offset: Int
+        var leftPadding: MLXArray?
+        var lengths: MLXArray?
+    }
+
+    private var speculativeCheckpoint: SpeculativeCheckpoint?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    /// Save the recurrent state at the last unconditionally committed token
+    /// inside a speculative verification pass.
+    package func saveSpeculativeCheckpoint(
+        convState: MLXArray,
+        recurrentState: MLXArray,
+        advancedBy tokenCount: Int
+    ) {
+        speculativeCheckpoint = SpeculativeCheckpoint(
+            state: [convState, recurrentState],
+            offset: offset,
+            leftPadding: leftPadding.map { $0 - tokenCount },
+            lengths: lengths.map { $0 - tokenCount })
+    }
+
+    package var hasSpeculativeCheckpoint: Bool {
+        speculativeCheckpoint != nil
+    }
+
+    @discardableResult
+    package func restoreSpeculativeCheckpoint() -> Bool {
+        guard let checkpoint = speculativeCheckpoint else { return false }
+        cache = checkpoint.state
+        offset = checkpoint.offset
+        leftPadding = checkpoint.leftPadding
+        lengths = checkpoint.lengths
+        speculativeCheckpoint = nil
+        return true
+    }
+
+    package func discardSpeculativeCheckpoint() {
+        speculativeCheckpoint = nil
     }
 
     public override func copy() -> any KVCache {
@@ -2132,7 +2299,7 @@ public class CacheList: BaseKVCache {
         super.init()
     }
 
-    /// Internal initializer for reconstruction from deserialized children
+    /// Internal initializer for reconstruction from deserialized children.
     internal init(caches: [KVCache]) {
         self.caches = caches
         super.init()
@@ -2185,6 +2352,22 @@ public class CacheList: BaseKVCache {
         }
     }
 
+    /// Rewrite every non-composite child while preserving its stable tree path.
+    func rewriteLeaves(
+        path: [Int],
+        using transform: (KVCacheLeaf) -> KVCache
+    ) {
+        caches = caches.enumerated().map { index, child in
+            let childPath = path + [index]
+            if let list = child as? CacheList {
+                list.rewriteLeaves(path: childPath, using: transform)
+                return list
+            }
+            let leaf = KVCacheLeaf(path: childPath, cache: child)
+            return transform(leaf)
+        }
+    }
+
     public override func prepare(lengths: [Int]?) {
         caches.forEach { $0.prepare(lengths: lengths) }
     }
@@ -2198,7 +2381,11 @@ public class CacheList: BaseKVCache {
     }
 
     public override var isTrimmable: Bool {
-        caches.allSatisfy { $0.isTrimmable }
+        isTrimmable(after: 0)
+    }
+
+    public override func isTrimmable(after positions: Int) -> Bool {
+        caches.allSatisfy { $0.isTrimmable(after: positions) }
     }
 
     @discardableResult
@@ -2210,7 +2397,7 @@ public class CacheList: BaseKVCache {
         return result
     }
 
-    /// Internal accessor for child caches (used by serialization)
+    /// Internal accessor for child caches (used by serialization and policy reporting).
     internal var children: [KVCache] { caches }
 
     // MARK: - Serialization
@@ -2278,8 +2465,10 @@ public class CacheList: BaseKVCache {
 
 // MARK: - Error Types
 
-struct KVCacheError: Error {
+struct KVCacheError: Error, LocalizedError {
     let message: String
+
+    var errorDescription: String? { message }
 }
 
 // MARK: - Utility Functions
@@ -2292,11 +2481,50 @@ private func cacheClassName(_ cache: KVCache) -> String {
     case is ArraysCache: return "ArraysCache"
     case is BatchRotatingKVCache: return "BatchRotatingKVCache"
     case is RotatingKVCache: return "RotatingKVCache"
+    case is VarianceNormalizedKVCache: return "VarianceNormalizedKVCache"
     case is QuantizedKVCache: return "QuantizedKVCache"
     case is BatchKVCache: return "BatchKVCache"
+    case is TurboQuantKVCache: return "TurboQuantKVCache"
     case is KVCacheSimple: return "KVCache"
     case is CacheList: return "CacheList"
     default: return "KVCache"
+    }
+}
+
+/// A prompt cache and the model state that belongs with it.
+///
+/// Keeping the two together is the point: a KV cache restored without its model state positions
+/// later tokens as if the cached prefix contained no images, which changes the output silently.
+/// Pass a snapshot to a `ChatSession` initializer that accepts a `promptCache` rather than
+/// unpacking it into the `cache:` initializer.
+///
+/// A snapshot does not carry the chat transcript. A `ChatSession` restored from one appends each
+/// new message rather than re-rendering the conversation, so a later image-bearing turn builds a
+/// different prompt than it would in a session that still holds its history. Positions stay
+/// correct either way. On vision encoders that attend across image boundaries (Qwen2-VL today)
+/// the new image's features differ too, since it is encoded alone rather than beside the cached
+/// one; Qwen2.5-VL, Qwen3-VL, and GLM-OCR isolate each image and are unaffected.
+///
+/// The cache instances are mutable reference types. Transfer a snapshot to one session or copy the
+/// caches before constructing multiple sessions from it.
+public struct PromptCacheSnapshot {
+    public let cache: [KVCache]
+    public let metadata: [String: String]
+    public let state: LMOutput.State?
+
+    /// Pair a cache with the model state that belongs with it.
+    ///
+    /// Use this when the cache was built in process — ``loadPromptCacheSnapshot(url:)`` returns a
+    /// snapshot for caches read from disk.
+    ///
+    /// - Parameters:
+    ///   - cache: the KV cache
+    ///   - metadata: optional caller metadata to carry alongside it
+    ///   - state: the model state captured with the cache, if the model produced any
+    public init(cache: [KVCache], metadata: [String: String] = [:], state: LMOutput.State? = nil) {
+        self.cache = cache
+        self.metadata = metadata
+        self.state = state
     }
 }
 
@@ -2306,14 +2534,23 @@ private func cacheClassName(_ cache: KVCache) -> String {
 ///   - url: The URL to the `.safetensors` file
 ///   - cache: The model cache state
 ///   - metadata: Optional metadata to save along with cache state
+///   - state: Optional model state associated with the cache
 public func savePromptCache(
     url: URL,
     cache: [KVCache],
-    metadata: [String: String] = [:]
+    metadata: [String: String] = [:],
+    state: LMOutput.State? = nil
 ) throws {
+    let stateArrays = try promptCacheStateArrays(state, userMetadata: metadata)
+    guard stateArrays.isEmpty || !cache.isEmpty else {
+        throw KVCacheError(message: "Model state requires at least one prompt cache")
+    }
+
     let cacheData = cache.map { $0.state }
     let cacheInfo = cache.map { $0.metaState }
-    let cacheClasses = cache.map { cacheClassName($0) }
+    let cacheClasses = cache.map {
+        promptCacheClassName(cacheClassName($0), hasState: !stateArrays.isEmpty)
+    }
 
     // Flatten cache data using tree_flatten compatible structure: "i.j" format
     var flattenedData: [String: MLXArray] = [:]
@@ -2343,21 +2580,39 @@ public func savePromptCache(
         flattenedMetadata["2.\(i)"] = className
     }
 
+    addPromptCacheState(
+        stateArrays, flattenedData: &flattenedData, flattenedMetadata: &flattenedMetadata)
+
     try save(arrays: flattenedData, metadata: flattenedMetadata, url: url)
 }
 
-/// Load a prompt cache from a file.
+/// Load a prompt cache from a file, without model state.
+///
+/// Prefer ``loadPromptCacheSnapshot(url:)``, which also restores the model state a cache needs to
+/// be continued correctly. This tuple form has no slot for that state, so it rejects files that
+/// carry any rather than dropping it. Models that position from a carried anchor refuse a warm
+/// cache that arrives without one, so a cache saved through this API cannot warm them.
 ///
 /// - Parameters:
 ///   - url: The URL to the `.safetensors` file
 /// - Returns: The prompt cache and the metadata
+/// - Throws: If the file contains model state that this tuple return value cannot represent
 public func loadPromptCache(
     url: URL
 ) throws -> ([KVCache], [String: String]) {
-    let (arrays, metadata) = try loadArraysAndMetadata(url: url)
+    let promptCache = try loadPromptCacheSnapshot(url: url)
+    guard promptCache.state == nil else {
+        throw KVCacheError(
+            message:
+                "Prompt cache contains model state; use loadPromptCacheSnapshot(url:) to restore it"
+        )
+    }
+    return (promptCache.cache, promptCache.metadata)
+}
 
-    // Unflatten arrays using tree_unflatten compatible logic
-    let cacheData = unflattenArrays(arrays)
+/// Load a prompt cache and its associated model state from a file.
+public func loadPromptCacheSnapshot(url: URL) throws -> PromptCacheSnapshot {
+    var (arrays, metadata) = try loadArraysAndMetadata(url: url)
 
     // Unflatten metadata using tree_unflatten compatible logic
     let unflattenedMetadata = unflattenMetadata(metadata)
@@ -2369,12 +2624,19 @@ public func loadPromptCache(
     }
 
     let cacheInfo = unflattenedMetadata[0] as? [[String]] ?? []
-    let userMetadata = unflattenedMetadata[1] as? [String: String] ?? [:]
-    let cacheClasses = unflattenedMetadata[2] as? [String] ?? []
+    let storedUserMetadata = unflattenedMetadata[1] as? [String: String] ?? [:]
+    let (state, userMetadata) = try loadPromptCacheState(
+        arrays: &arrays, metadata: storedUserMetadata)
+    let storedCacheClasses = unflattenedMetadata[2] as? [String] ?? []
+    let cacheClasses = try loadPromptCacheClasses(storedCacheClasses, hasState: state != nil)
 
-    guard cacheData.count == cacheInfo.count && cacheData.count == cacheClasses.count else {
+    guard cacheInfo.count == cacheClasses.count else {
         throw KVCacheError(message: "Mismatch in cache counts")
     }
+
+    // Metadata carries the cache count even when one or more valid caches have no arrays.
+    // State tensors were removed from `arrays` above, so only cache arrays remain here.
+    let cacheData = try unflattenArrays(arrays, cacheCount: cacheClasses.count)
 
     // Reconstruct cache instances
     var caches: [KVCache] = []
@@ -2387,8 +2649,121 @@ public func loadPromptCache(
         caches.append(cache)
     }
 
-    return (caches, userMetadata)
+    return PromptCacheSnapshot(cache: caches, metadata: userMetadata, state: state)
 }
+
+private func promptCacheStateArrays(
+    _ state: LMOutput.State?, userMetadata: [String: String]
+) throws -> [(key: String, value: MLXArray)] {
+    guard !userMetadata.keys.contains(where: { $0.hasPrefix(promptCacheStateMetadataPrefix) })
+    else {
+        throw KVCacheError(message: "User metadata uses the reserved prompt cache state namespace")
+    }
+    guard let state else { return [] }
+    return try state.serializedArrays().sorted { $0.key < $1.key }
+}
+
+private func addPromptCacheState(
+    _ stateArrays: [(key: String, value: MLXArray)],
+    flattenedData: inout [String: MLXArray], flattenedMetadata: inout [String: String]
+) {
+    guard !stateArrays.isEmpty else { return }
+
+    flattenedMetadata["1.\(promptCacheStateVersionKey)"] = promptCacheStateFormatVersion
+    flattenedMetadata["1.\(promptCacheStateCountKey)"] = String(stateArrays.count)
+    for (index, entry) in stateArrays.enumerated() {
+        flattenedData[promptCacheStateTensorKey(index)] = entry.value
+        flattenedMetadata["1.\(promptCacheStateEntryKey(index))"] = entry.key
+    }
+}
+
+private func loadPromptCacheState(
+    arrays: inout [String: MLXArray], metadata: [String: String]
+) throws -> (LMOutput.State?, [String: String]) {
+    let stateMetadata = metadata.filter { $0.key.hasPrefix(promptCacheStateMetadataPrefix) }
+    let stateTensorKeys = arrays.keys.filter { $0.hasPrefix(promptCacheStateTensorPrefix) }
+    guard !stateMetadata.isEmpty || !stateTensorKeys.isEmpty else { return (nil, metadata) }
+
+    guard metadata[promptCacheStateVersionKey] == promptCacheStateFormatVersion else {
+        throw KVCacheError(message: "Unsupported prompt cache state format")
+    }
+    guard let countValue = metadata[promptCacheStateCountKey],
+        let count = Int(countValue), count > 0
+    else {
+        throw KVCacheError(message: "Invalid prompt cache state count")
+    }
+
+    var serializedArrays: [String: MLXArray] = [:]
+    for index in 0 ..< count {
+        let tensorKey = promptCacheStateTensorKey(index)
+        guard let key = metadata[promptCacheStateEntryKey(index)],
+            let array = arrays.removeValue(forKey: tensorKey)
+        else {
+            throw KVCacheError(message: "Invalid prompt cache state entry at index \(index)")
+        }
+        guard serializedArrays.updateValue(array, forKey: key) == nil else {
+            throw KVCacheError(message: "Duplicate prompt cache state key: \(key)")
+        }
+    }
+
+    // The loop proved every expected entry is present; counting rejects the leftovers — a
+    // reserved-namespace key this reader does not know about means the file was written by
+    // something else, so refuse it rather than silently dropping part of the state.
+    guard stateMetadata.count == count + 2 else {
+        throw KVCacheError(message: "Unexpected prompt cache state metadata")
+    }
+    guard stateTensorKeys.count == count else {
+        throw KVCacheError(message: "Unexpected prompt cache state tensors")
+    }
+
+    let userMetadata = metadata.filter { !$0.key.hasPrefix(promptCacheStateMetadataPrefix) }
+    return (LMOutput.State(serializedArrays: serializedArrays), userMetadata)
+}
+
+/// Prefixes the stored cache class name when the file carries model state.
+///
+/// The marker is redundant for this reader — the state metadata already says whether state is
+/// present — and exists for older ones. A reader predating model state would ignore the
+/// `__mlx_lm_state_` metadata entirely and restore the cache without its continuation anchor,
+/// which positions new tokens as if the cached prefix held no images. Poisoning the class name
+/// makes that reader fail with "Unknown cache class" instead of continuing at the wrong offsets.
+private func promptCacheClassName(_ className: String, hasState: Bool) -> String {
+    hasState ? "\(promptCacheStateClassPrefix)\(className)" : className
+}
+
+private func loadPromptCacheClasses(_ classNames: [String], hasState: Bool) throws -> [String] {
+    if hasState {
+        guard !classNames.isEmpty,
+            classNames.allSatisfy({ $0.hasPrefix(promptCacheStateClassPrefix) })
+        else {
+            throw KVCacheError(
+                message: "Prompt cache model state is missing its compatibility marker")
+        }
+        return classNames.map { String($0.dropFirst(promptCacheStateClassPrefix.count)) }
+    }
+
+    guard !classNames.contains(where: { $0.hasPrefix(promptCacheStateClassPrefix) }) else {
+        throw KVCacheError(message: "Prompt cache compatibility marker has no model state")
+    }
+    return classNames
+}
+
+private func promptCacheStateEntryKey(_ index: Int) -> String {
+    "\(promptCacheStateMetadataPrefix)\(index)_key"
+}
+
+private func promptCacheStateTensorKey(_ index: Int) -> String {
+    "\(promptCacheStateTensorPrefix)\(index)"
+}
+
+private let promptCacheStateFormatVersion = "1"
+private let promptCacheStateMetadataPrefix = "__mlx_lm_state_"
+private let promptCacheStateVersionKey = "__mlx_lm_state_version"
+private let promptCacheStateCountKey = "__mlx_lm_state_count"
+private let promptCacheStateTensorPrefix = "__mlx_lm_state_tensor_"
+// Derived so the format version lives in exactly one place.
+private let promptCacheStateClassPrefix =
+    "__mlx_lm_state_v\(promptCacheStateFormatVersion)__:"
 
 /// Reconstruct a single cache from its class name, state arrays, and metaState.
 ///
@@ -2401,39 +2776,145 @@ private func restoreCacheFromMetaState(
 ) throws -> KVCache {
     switch className {
     case "KVCache", "KVCacheSimple":
+        try validatePromptCache(
+            className: "KVCacheSimple", state: state, stateCounts: [0, 2],
+            metadata: metaState, metadataCounts: [1])
+        guard metaState == [""] else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: KVCacheSimple metadata must contain its single empty placeholder."
+            )
+        }
         let cache = KVCacheSimple()
-        cache.state = state
-        cache.metaState = metaState
+        if !state.isEmpty {
+            cache.state = state
+        }
         return cache
 
     case "RotatingKVCache":
-        guard metaState.count >= 5 else {
-            throw KVCacheError(
-                message: "Invalid RotatingKVCache metaState - expected 5 values")
-        }
-        if metaState[1] == "None" {
+        try validatePromptCache(
+            className: className, state: state, stateCounts: [0, 2],
+            metadata: metaState, metadataCounts: [5, 6])
+        let values = try promptCacheIntegers(metaState.prefix(5), className: className)
+        if metaState.count == 6,
+            RotatingKVCache.CapacityOrigin(rawValue: metaState[5]) == nil
+        {
             throw KVCacheError(
                 message:
-                    "RotatingKVCache with maxSize=None is not supported.")
+                    "Corrupt prompt cache: invalid RotatingKVCache capacity origin '\(metaState[5])'."
+            )
         }
-        guard let maxSize = Int(metaState[1]) else {
-            throw KVCacheError(
-                message: "Failed to parse RotatingKVCache maxSize from: \(metaState[1])")
+
+        let cache = RotatingKVCache(maxSize: values[1])
+        if !state.isEmpty {
+            cache.state = state
         }
-        let cache = RotatingKVCache(maxSize: maxSize)
-        cache.state = state
         cache.metaState = metaState
         return cache
 
     case "QuantizedKVCache":
-        let cache = QuantizedKVCache()
-        cache.state = state
+        try validatePromptCache(
+            className: className, state: state, stateCounts: [0, 4, 6],
+            metadata: metaState, metadataCounts: [4])
+        let values = try promptCacheIntegers(metaState, className: className)
+        let cache = QuantizedKVCache(groupSize: values[2], bits: values[3])
+        if !state.isEmpty {
+            cache.state = state
+        }
         cache.metaState = metaState
         return cache
 
-    case "ChunkedKVCache":
-        let cache = ChunkedKVCache()
+    case "VarianceNormalizedKVCache":
+        guard metaState.count == 7 || metaState.count == 10 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: VarianceNormalizedKVCache metadata must contain 7 legacy or 10 versioned values."
+            )
+        }
+        let values = try promptCacheIntegers(Array(metaState.prefix(7)), className: className)
+        let tileSize = values[0]
+        let offset = values[1]
+        let keyBits = values[2]
+        let valueBits = values[3]
+        let sinkhornIterations = values[4]
+        let tileCount = values[5]
+        let tailLength = values[6]
+        guard
+            (try? VarianceNormalizedKVCacheConfiguration(
+                keyBits: keyBits,
+                valueBits: valueBits,
+                tileSize: tileSize,
+                sinkhornIterations: sinkhornIterations)) != nil,
+            offset >= 0,
+            tileCount >= 0,
+            (0 ..< tileSize).contains(tailLength),
+            metaState.count == 7
+                || (Int(metaState[7]) == VarianceNormalizedKVCache.metadataVersion
+                    && (metaState[8] == "none"
+                        || varianceNormalizedDType(named: metaState[8])
+                            .map(isSupportedVarianceNormalizedDType) == true)
+                    && (metaState[9] == "none"
+                        || varianceNormalizedDType(named: metaState[9])
+                            .map(isSupportedVarianceNormalizedDType) == true))
+        else {
+            throw KVCacheError(
+                message: "Corrupt prompt cache: invalid VarianceNormalizedKVCache metadata."
+            )
+        }
+        let (tiledLength, tileLengthOverflow) = tileCount.multipliedReportingOverflow(
+            by: tileSize)
+        let (representedLength, offsetOverflow) = tiledLength.addingReportingOverflow(tailLength)
+        let tailStateCount =
+            tailLength > 0 ? VarianceNormalizedKVCache.tailStateCount : 0
+        let tileStateCount = state.count - min(state.count, tailStateCount)
+        let hasValidTileStateCount =
+            if tileCount == 0 {
+                tileStateCount == 0
+            } else {
+                tileStateCount.isMultiple(of: tileCount)
+                    && [
+                        VarianceNormalizedKVCache.compactTileStateCount,
+                        VarianceNormalizedKVCache.legacyTileStateCount,
+                    ].contains(tileStateCount / tileCount)
+            }
+        guard
+            !tileLengthOverflow,
+            !offsetOverflow,
+            offset == representedLength,
+            state.count >= tailStateCount,
+            hasValidTileStateCount,
+            state.allSatisfy({ $0.ndim == 4 })
+        else {
+            throw KVCacheError(
+                message: "Corrupt prompt cache: invalid VarianceNormalizedKVCache state."
+            )
+        }
+        let cache = VarianceNormalizedKVCache(
+            tileSize: tileSize,
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkhornIterations: sinkhornIterations)
+        cache.metaState = metaState
         cache.state = state
+        return cache
+
+    case "ChunkedKVCache":
+        try validatePromptCache(
+            className: className, state: state, stateCounts: [0, 2],
+            metadata: metaState, metadataCounts: [2])
+
+        let chunkSize: Int? =
+            if metaState[0] == "None" {
+                nil
+            } else {
+                try promptCacheInteger(metaState[0], className: className)
+            }
+        _ = try promptCacheInteger(metaState[1], className: className)
+
+        let cache = ChunkedKVCache(chunkSize: chunkSize)
+        if !state.isEmpty {
+            cache.state = state
+        }
         cache.metaState = metaState
         return cache
 
@@ -2462,6 +2943,22 @@ private func restoreCacheFromMetaState(
         cache.restoreFromMetaState(state: state, savedMetaState: metaState)
         return cache
 
+    case "TurboQuantKVCache":
+        guard metaState.count >= 5,
+            let bits = Int(metaState[1]),
+            let keyBits = Int(metaState[2]),
+            let valueBits = Int(metaState[3]),
+            let seed = UInt64(metaState[4])
+        else {
+            throw KVCacheError(
+                message: "Invalid TurboQuantKVCache metaState")
+        }
+        let cache = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed)
+        cache.state = state
+        cache.metaState = metaState
+        return cache
+
     case "CacheList":
         return try CacheList.fromState(state: state, metaState: metaState)
 
@@ -2470,44 +2967,74 @@ private func restoreCacheFromMetaState(
     }
 }
 
+private func validatePromptCache(
+    className: String,
+    state: [MLXArray],
+    stateCounts: Set<Int>,
+    metadata: [String],
+    metadataCounts: Set<Int>
+) throws {
+    guard stateCounts.contains(state.count), metadataCounts.contains(metadata.count),
+        state.allSatisfy({ $0.ndim == 4 })
+    else {
+        throw KVCacheError(
+            message: "Corrupt prompt cache: invalid \(className) state or metadata shape."
+        )
+    }
+}
+
+private func promptCacheInteger(_ value: String, className: String) throws -> Int {
+    guard let value = Int(value) else {
+        throw KVCacheError(
+            message: "Corrupt prompt cache: \(className) metadata must contain integers."
+        )
+    }
+    return value
+}
+
+private func promptCacheIntegers(
+    _ metadata: some Collection<String>, className: String
+) throws -> [Int] {
+    try metadata.map { try promptCacheInteger($0, className: className) }
+}
+
 /// Unflatten arrays from tree_flatten format (e.g., "0.1", "1.0") to nested structure
-private func unflattenArrays(_ flatArrays: [String: MLXArray]) -> [[MLXArray]] {
+private func unflattenArrays(
+    _ flatArrays: [String: MLXArray],
+    cacheCount: Int
+) throws -> [[MLXArray]] {
     var arrayMap: [Int: [Int: MLXArray]] = [:]
 
     // Parse all keys and organize by indices
     for (key, array) in flatArrays {
         let components = key.split(separator: ".")
-        if components.count >= 2,
+        guard components.count == 2,
             let i = Int(components[0]),
-            let j = Int(components[1])
-        {
-            if arrayMap[i] == nil {
-                arrayMap[i] = [:]
-            }
-            arrayMap[i]![j] = array
+            let j = Int(components[1]),
+            (0 ..< cacheCount).contains(i),
+            j >= 0
+        else {
+            throw KVCacheError(
+                message: "Corrupt prompt cache: invalid array key '\(key)'.")
         }
+        arrayMap[i, default: [:]][j] = array
     }
 
-    // Convert to ordered array structure
-    var result: [[MLXArray]] = []
-    let maxI = arrayMap.keys.max() ?? -1
-
-    for i in 0 ... maxI {
-        if let innerMap = arrayMap[i] {
-            let maxJ = innerMap.keys.max() ?? -1
-            var innerArray: [MLXArray] = []
-            for j in 0 ... maxJ {
-                if let array = innerMap[j] {
-                    innerArray.append(array)
-                }
+    return try (0 ..< cacheCount).map { cacheIndex in
+        guard let arrays = arrayMap[cacheIndex], !arrays.isEmpty else { return [] }
+        var result: [MLXArray] = []
+        result.reserveCapacity(arrays.count)
+        for arrayIndex in 0 ..< arrays.count {
+            guard let array = arrays[arrayIndex] else {
+                throw KVCacheError(
+                    message:
+                        "Corrupt prompt cache: cache \(cacheIndex) has non-contiguous array indices."
+                )
             }
-            result.append(innerArray)
-        } else {
-            result.append([])
+            result.append(array)
         }
+        return result
     }
-
-    return result
 }
 
 /// Unflatten metadata from tree_flatten format to nested structure
@@ -2555,38 +3082,40 @@ private func unflattenMetadata(_ flatMetadata: [String: String]) -> [Any] {
 ///
 /// This function will defer the cache construction to the model if it has a
 /// `newCache` method, otherwise it will make a default KV cache.
+///
+/// - Throws: ``KVCacheConfigurationError`` when the request or a model-defined
+///   cache size is invalid.
 public func makePromptCache(
     model: any LanguageModel,
     parameters: GenerateParameters? = nil
-) -> [KVCache] {
+) throws -> [KVCache] {
     // The model already conforms to LanguageModel which has newCache
     // If it also conforms to KVCacheDimensionProvider, the extension will provide the implementation
-    return model.newCache(parameters: parameters)
+    return try model.newCache(parameters: parameters)
 }
 
 /// Legacy function for backwards compatibility
 public func makePromptCache(
     model: any LanguageModel,
     maxKVSize: Int? = nil
-) -> [KVCache] {
+) throws -> [KVCache] {
     let parameters = maxKVSize.map { GenerateParameters(maxKVSize: $0) }
-    return makePromptCache(model: model, parameters: parameters)
+    return try makePromptCache(model: model, parameters: parameters)
 }
 
 /// Fallback function to create cache when layer count is known
 ///
 /// This function creates a default cache structure when the number of layers is known.
 /// Use this when `makePromptCache` cannot determine the layer count automatically.
+///
+/// - Throws: ``KVCacheConfigurationError`` when `maxKVSize` is invalid.
 public func makePromptCacheWithLayerCount(
     numLayers: Int,
     maxKVSize: Int? = nil
-) -> [KVCache] {
-    if let maxKVSize = maxKVSize {
-        return (0 ..< numLayers).map { _ in
-            RotatingKVCache(maxSize: maxKVSize, keep: 4)
-        }
-    } else {
-        return (0 ..< numLayers).map { _ in KVCacheSimple() }
+) throws -> [KVCache] {
+    let parameters = maxKVSize.map { GenerateParameters(maxKVSize: $0) }
+    return try (0 ..< numLayers).map { _ in
+        try makeAttentionKVCache(parameters: parameters)
     }
 }
 
@@ -2604,6 +3133,42 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
     cache.dropFirst().forEach { $0.trim(numTokens) }
     return cache.first?.trim(numTokens) ?? 0
+}
+
+/// Rewind a one-token speculative tail in a hybrid attention/recurrent cache.
+/// Attention entries trim normally; Mamba entries restore the checkpoint the
+/// model captured after the round's committed bonus token.
+@discardableResult
+package func rewindSpeculativePromptCache(
+    _ cache: [KVCache], numTokens: Int
+) -> Int {
+    guard numTokens == 1,
+        cache.allSatisfy({ entry in
+            if entry.isTrimmable {
+                return entry.offset >= numTokens
+            }
+            return (entry as? MambaCache)?.hasSpeculativeCheckpoint == true
+        })
+    else { return 0 }
+
+    for entry in cache {
+        if entry.isTrimmable {
+            guard entry.trim(numTokens) == numTokens else {
+                preconditionFailure("Speculative cache validation and rewind diverged")
+            }
+        } else {
+            guard (entry as? MambaCache)?.restoreSpeculativeCheckpoint() == true else {
+                preconditionFailure("Missing recurrent speculative checkpoint")
+            }
+        }
+    }
+    return numTokens
+}
+
+package func discardSpeculativePromptCacheCheckpoints(_ cache: [KVCache]) {
+    for case let entry as MambaCache in cache {
+        entry.discardSpeculativeCheckpoint()
+    }
 }
 
 // MARK: - Type Aliases
@@ -2663,23 +3228,15 @@ public func quantizedScaledDotProductAttention(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
+        scores = MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
 
     case .array(let maskArray):
-        if maskArray.dtype == .bool {
-            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-        } else {
-            scores = scores + maskArray
-        }
+        scores = applyMask(maskArray, to: scores)
 
     case .arrays(let maskArrays):
         // Handle multiple mask arrays - just use the first one for simplicity
         if let maskArray = maskArrays.first {
-            if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-            } else {
-                scores = scores + maskArray
-            }
+            scores = applyMask(maskArray, to: scores)
         }
 
     case .none:
@@ -2701,6 +3258,22 @@ public func quantizedScaledDotProductAttention(
     }
 
     return output
+
+    // Apply a boolean/additive mask, broadcasting batched masks over the GQA
+    // head-group axis: per-sequence masks are `[B, 1, L, S]`, but with
+    // `nRepeats > 1` the scores are 5-D `[B, nKVHeads, nRepeats, L, S]`, so a
+    // 4-D mask needs an extra axis to line up `B` with the batch dimension.
+    func applyMask(_ maskArray: MLXArray, to scores: MLXArray) -> MLXArray {
+        var maskArray = maskArray
+        if nRepeats > 1 && maskArray.ndim == 4 {
+            maskArray = expandedDimensions(maskArray, axis: -3)
+        }
+        if maskArray.dtype == .bool {
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+        } else {
+            return scores + maskArray
+        }
+    }
 }
 
 // MARK: - Dynamic Cache Quantization
@@ -2728,8 +3301,9 @@ public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int
 ///   - kvGroupSize: Group size for quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
 ///   - kvScheme: Scheme selector; overrides kvBits when it names a built-in
-///     affine scheme ("affine4", "affine8"). Unrecognized schemes are left to
-///     custom cache implementations and do not quantize here.
+///     affine scheme ("affine4", "affine8") or a TurboQuant scheme
+///     ("turbo4", "turbo4v2", ...). Unrecognized schemes are left to custom
+///     cache implementations and do not quantize here.
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
@@ -2737,64 +3311,164 @@ public func maybeQuantizeKVCache(
     quantizedKVStart: Int = 0,
     kvScheme: String? = nil
 ) {
-    // Resolve effective bits: kvScheme overrides kvBits.
-    let effectiveBits: Int
-    let effectiveGroupSize: Int
-    if let scheme = kvScheme, let resolved = resolveAffineScheme(scheme) {
-        effectiveBits = resolved.bits
-        effectiveGroupSize = resolved.groupSize
-    } else if let kvBits {
-        effectiveBits = kvBits
-        effectiveGroupSize = kvGroupSize
-    } else {
+    if let kvScheme,
+        resolveAffineScheme(kvScheme) == nil,
+        resolveTurboScheme(kvScheme) == nil,
+        resolveVarianceNormalizedScheme(kvScheme) == nil
+    {
         return
     }
+    let parameters = GenerateParameters(
+        kvBits: kvBits,
+        kvGroupSize: kvGroupSize,
+        quantizedKVStart: quantizedKVStart,
+        kvScheme: kvScheme)
+    guard let plan = try? parameters.kvCachePlan() else { return }
+    plan.apply(to: &cache)
+}
 
-    /// Recursively decide whether a cache (or any of its children) is eligible for
-    /// quantization: it must be a plain ``KVCacheSimple`` that is not already
-    /// quantized and whose offset has crossed the requested start threshold.
-    func isQuantizable(_ cache: KVCache) -> Bool {
-        if let list = cache as? CacheList {
-            return list.children.contains(where: isQuantizable)
+@discardableResult
+func maybeAffineQuantizeKVCache(
+    cache: inout [KVCache],
+    bits: Int,
+    groupSize: Int,
+    compressionStart: Int
+) -> Bool {
+    var awaitsCompressionStart = false
+    KVCacheTree.rewrite(&cache) { leaf in
+        guard case .simple(let simple) = leaf.kind else { return leaf.cache }
+        guard simple.offset > compressionStart else {
+            awaitsCompressionStart = true
+            return simple
         }
-        return cache is KVCacheSimple
-            && !(cache is QuantizedKVCache)
-            && cache.offset > quantizedKVStart
-    }
 
-    guard cache.contains(where: isQuantizable) else {
-        return
+        guard let quantized = try? simple.toQuantized(groupSize: groupSize, bits: bits) else {
+            return simple
+        }
+        return quantized
     }
+    return !awaitsCompressionStart
+}
 
-    /// Attempt to convert a single cache to its quantized form. Returns the
-    /// original cache if conversion is not possible for this entry.
-    func quantize(_ cache: KVCacheSimple) -> KVCache {
-        let state = cache.state
-        if state.count == 2 {
-            let keyHeadDim = state[0].dim(3)
-            let valueHeadDim = state[1].dim(3)
+@discardableResult
+func maybeVarianceNormalizeKVCache(
+    cache: inout [KVCache],
+    keyBits: Int,
+    valueBits: Int,
+    tileSize: Int,
+    sinkhornIterations: Int,
+    compressionStart: Int
+) -> Bool {
+    var awaitsCompressionStart = false
+    KVCacheTree.rewrite(&cache) { leaf in
+        guard case .simple(let simple) = leaf.kind else { return leaf.cache }
+        guard simple.offset > compressionStart else {
+            awaitsCompressionStart = true
+            return simple
+        }
+
+        let state = simple.innerState()
+        if state.count >= 2 {
             guard
-                resolvedKVQuantizationGroupSize(
-                    requested: effectiveGroupSize,
-                    keyHeadDim: keyHeadDim,
-                    valueHeadDim: valueHeadDim
-                ) != nil
+                supportsVarianceNormalizedKVCache(
+                    keyHeadDim: state[0].dim(3),
+                    valueHeadDim: state[1].dim(3),
+                    tileSize: tileSize)
             else {
-                return cache
+                return simple
             }
         }
-        return cache.toQuantized(groupSize: effectiveGroupSize, bits: effectiveBits)
-    }
 
-    for i in 0 ..< cache.count {
-        if let list = cache[i] as? CacheList {
-            list.mapChildren { child in
-                guard let simpleCache = child as? KVCacheSimple else { return child }
-                return quantize(simpleCache)
-            }
-        } else if let simpleCache = cache[i] as? KVCacheSimple {
-            cache[i] = quantize(simpleCache)
+        return simple.toVarianceNormalized(
+            tileSize: tileSize,
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkhornIterations: sinkhornIterations)
+    }
+    return !awaitsCompressionStart
+}
+
+// MARK: - Attention Helpers
+
+/// Apply a symbolic or array attention mask to score logits.
+func applyAttentionMask(
+    scores: MLXArray,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXArray {
+    switch mask {
+    case .causal:
+        let (qL, kL) = (scores.dim(-2), scores.dim(-1))
+        let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
+        let kIndices = MLXArray(0 ..< kL)
+        let causalMask = greaterEqual(
+            expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
+        return MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
+
+    case .array(let maskArray):
+        if maskArray.dtype == .bool {
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+        } else {
+            return scores + maskArray
         }
-        // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
+
+    case .arrays(let maskArrays):
+        if let maskArray = maskArrays.first {
+            if maskArray.dtype == .bool {
+                return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+            } else {
+                return scores + maskArray
+            }
+        }
+        return scores
+
+    case .none:
+        return scores
+    }
+}
+
+func attentionScores(
+    queries: MLXArray,
+    keys: MLXArray,
+    scale: Float
+) -> MLXArray {
+    let (batchSize, queryHeadCount, queryLength, headDim) = (
+        queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)
+    )
+    let kvHeadCount = keys.dim(1)
+    let repeats = queryHeadCount / kvHeadCount
+    let scaledQueries = queries * scale
+
+    if repeats > 1 {
+        let groupedQueries = scaledQueries.reshaped([
+            batchSize, kvHeadCount, repeats, queryLength, headDim,
+        ])
+        let groupedKeys = expandedDimensions(keys, axis: -3)
+        return matmul(groupedQueries, groupedKeys.transposed(0, 1, 2, 4, 3))
+            .reshaped(batchSize, queryHeadCount, queryLength, keys.dim(2))
+    } else {
+        return matmul(scaledQueries, keys.transposed(0, 1, 3, 2))
+    }
+}
+
+func attentionValues(
+    weights: MLXArray,
+    values: MLXArray,
+    queryHeadCount: Int
+) -> MLXArray {
+    let (batchSize, _, queryLength, keyLength) = (
+        weights.dim(0), weights.dim(1), weights.dim(2), weights.dim(3)
+    )
+    let kvHeadCount = values.dim(1)
+    let repeats = queryHeadCount / kvHeadCount
+
+    if repeats > 1 {
+        let groupedWeights = weights.reshaped([
+            batchSize, kvHeadCount, repeats, queryLength, keyLength,
+        ])
+        let groupedValues = expandedDimensions(values, axis: -3)
+        return matmul(groupedWeights, groupedValues)
+            .reshaped(batchSize, queryHeadCount, queryLength, values.dim(3))
+    } else {
+        return matmul(weights, values)
     }
 }

@@ -91,6 +91,7 @@ public enum VLMTypeRegistry {
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
+        "qwen3_vl_moe": create(Qwen3VLMoEConfiguration.self, Qwen3VLMoE.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
@@ -105,6 +106,7 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
     ])
 }
 
@@ -140,6 +142,8 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
+        "MuseGlimmerProcessor": create(
+            MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
     ])
 }
 
@@ -268,6 +272,18 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let museGlimmer30B4bit = ModelConfiguration(
+        id: "mlx-community/Muse-Glimmer-30B-4bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|eot|>", "<|end_of_text|>"],
+        toolCallFormat: .atem,
+        reasoningConfig: ReasoningConfig(
+            startDelimiter: "to=self<|message|>",
+            endDelimiter: "<|eom|>",
+            promptStrategy: .none,
+            isSpecialToken: true)
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -287,6 +303,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             fastvlm,
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
+            museGlimmer30B4bit,
         ]
     }
 
@@ -311,11 +328,15 @@ public final class VLMModelFactory: GenericModelFactory {
 
     public init(
         typeRegistry: ModelTypeRegistry<LanguageModel>, processorRegistry: ProcessorTypeRegistry,
-        modelRegistry: AbstractModelRegistry
+        modelRegistry: AbstractModelRegistry,
+        conventionsRegistry: ChatConventionsRegistry = .shared,
+        processorLoadingRegistry: VLMProcessorLoadingRegistry = .shared
     ) {
         self.typeRegistry = typeRegistry
         self.processorRegistry = processorRegistry
         self.modelRegistry = modelRegistry
+        self.conventionsRegistry = conventionsRegistry
+        self.processorLoadingRegistry = processorLoadingRegistry
     }
 
     /// Shared instance with default behavior.
@@ -331,6 +352,13 @@ public final class VLMModelFactory: GenericModelFactory {
 
     /// registry of model id to configuration, e.g. `mlx-community/paligemma-3b-mix-448-8bit`
     public let modelRegistry: AbstractModelRegistry
+
+    /// resolvers for chat conventions that are keyed on model id rather than declared
+    /// by the model itself, e.g. DeepSeek-R1
+    public let conventionsRegistry: ChatConventionsRegistry
+
+    /// resolvers for processor metadata that is absent or incorrect in a checkpoint
+    public let processorLoadingRegistry: VLMProcessorLoadingRegistry
 
     public func _load(
         configuration: ResolvedModelConfiguration,
@@ -365,7 +393,7 @@ public final class VLMModelFactory: GenericModelFactory {
         }
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        var eosTokenIds = baseConfig.effectiveEOSTokenIds
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
@@ -381,9 +409,23 @@ public final class VLMModelFactory: GenericModelFactory {
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
 
-        // Auto-detect tool call format from model type if not explicitly set
+        // Chat conventions. An explicit value on the configuration wins, followed
+        // by a registered resolver that sees the repo id. Checkpoint metadata then
+        // resolves the model declaration against the selected tool template.
+        let modelId = configuration.name
         if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+            mutableConfiguration.toolCallFormat =
+                conventionsRegistry.toolCallFormat(
+                    modelId: modelId, modelType: baseConfig.modelType)
+                ?? ToolCallFormat.resolved(
+                    forTokenizerDirectory: configuration.tokenizerDirectory,
+                    modelFormat: model.toolCallFormat)
+        }
+        if mutableConfiguration.reasoningConfig == nil {
+            mutableConfiguration.reasoningConfig =
+                conventionsRegistry.reasoningConfig(
+                    modelId: modelId, modelType: baseConfig.modelType)
+                ?? model.reasoningConfig
         }
 
         // Load tokenizer from model directory (or alternate tokenizer repo),
@@ -391,19 +433,26 @@ public final class VLMModelFactory: GenericModelFactory {
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
         // parallel scheduling. This may briefly block a cooperative thread pool thread,
         // but the config file is small and model loading is not a high-concurrency path.
+        let processorLoadingContext = VLMProcessorLoadingContext(
+            modelId: configuration.name,
+            modelType: baseConfig.modelType,
+            configurationData: configData)
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
-        async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
+        async let processorConfigTask = resolveProcessorConfiguration(
+            from: modelDirectory,
+            context: processorLoadingContext,
+            registry: processorLoadingRegistry)
 
-        try loadWeights(
+        try await loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            weightFileSelection: configuration.weightFileSelection)
 
         let tokenizer = try await tokenizerTask
-        let processorConfigData: Data
-        let baseProcessorConfig: BaseProcessorConfiguration
+        let processorConfiguration: VLMProcessorConfiguration
         do {
-            (processorConfigData, baseProcessorConfig) = try await processorConfigTask
+            processorConfiguration = try await processorConfigTask
         } catch let error as ProcessorConfigError {
             if let decodingError = error.underlying as? DecodingError {
                 throw ModelFactoryError.configurationDecodingError(
@@ -411,21 +460,21 @@ public final class VLMModelFactory: GenericModelFactory {
             }
             throw ModelFactoryError.configurationFileError(
                 error.filename, configuration.name, error.underlying)
+        } catch let error as DecodingError {
+            throw ModelFactoryError.configurationDecodingError(
+                configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Override processor type based on model type for models that need special handling
-        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
-        // to handle spatial merging correctly
-        let processorTypeOverrides: [String: String] = [
-            "mistral3": "Mistral3Processor",
-            "gemma4_unified": "Gemma4UnifiedProcessor",
-        ]
-        let processorType =
-            processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
-
-        let processor = try await processorRegistry.createModel(
-            configuration: processorConfigData,
-            processorType: processorType, tokenizer: tokenizer)
+        let baseProcessor = try await processorRegistry.createModel(
+            configuration: processorConfiguration.data,
+            processorType: processorConfiguration.processorType, tokenizer: tokenizer)
+        let processor: any UserInputProcessor
+        if let messageGenerator = mutableConfiguration.messageGenerator {
+            processor = MessageGeneratorUserInputProcessor(
+                processor: baseProcessor, messageGenerator: messageGenerator)
+        } else {
+            processor = baseProcessor
+        }
 
         // Build a ModelConfiguration for the ModelContext
         let tokenizerSource: TokenizerSource? =
@@ -439,7 +488,9 @@ public final class VLMModelFactory: GenericModelFactory {
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             stopStrings: mutableConfiguration.stopStrings,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            reasoningConfig: mutableConfiguration.reasoningConfig,
+            messageGenerator: mutableConfiguration.messageGenerator)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
@@ -449,27 +500,96 @@ public final class VLMModelFactory: GenericModelFactory {
 }
 
 /// Error wrapper that includes the filename for better error messages.
-private struct ProcessorConfigError: Error {
+struct ProcessorConfigError: Error {
     let filename: String
     let underlying: Error
+}
+
+/// Selects checkpoint processor metadata, then resolves the processor type.
+func resolveProcessorConfiguration(
+    from modelDirectory: URL,
+    context: VLMProcessorLoadingContext,
+    registry: VLMProcessorLoadingRegistry
+) async throws -> VLMProcessorConfiguration {
+    let configuration = try await loadProcessorConfig(from: modelDirectory) {
+        try registry.fallbackProcessorConfiguration(for: context)
+    }
+    let processorType =
+        try registry.processorType(
+            for: context, declaredProcessorType: configuration.processorType)
+        ?? configuration.processorType
+    guard let processorType else {
+        throw missingProcessorTypeError(filename: configuration.filename)
+    }
+    return VLMProcessorConfiguration(data: configuration.data, processorType: processorType)
+}
+
+/// Processor configuration selected from a checkpoint file or a generated fallback.
+/// The type remains optional until loading resolvers have had a chance to supply one.
+struct LoadedVLMProcessorConfiguration {
+    let data: Data
+    let processorType: String?
+    let filename: String
 }
 
 /// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
 /// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
 /// Throws ProcessorConfigError wrapping any underlying error with the filename.
-private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
-    Data, BaseProcessorConfiguration
-) {
+func loadProcessorConfig(
+    from modelDirectory: URL,
+    fallback: () throws -> VLMProcessorConfiguration? = { nil }
+) async throws -> LoadedVLMProcessorConfiguration {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
-    let url =
-        FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
-        ? preprocessorConfigURL
-        : processorConfigURL
+
+    if FileManager.default.fileExists(atPath: preprocessorConfigURL.path) {
+        return try readProcessorConfig(from: preprocessorConfigURL)
+    }
+    if FileManager.default.fileExists(atPath: processorConfigURL.path) {
+        return try readProcessorConfig(from: processorConfigURL)
+    }
+    if let fallback = try fallback() {
+        return LoadedVLMProcessorConfiguration(
+            data: fallback.data,
+            processorType: fallback.processorType,
+            filename: "config.json")
+    }
+
+    return try readProcessorConfig(from: processorConfigURL)
+}
+
+private struct DeclaredProcessorConfiguration: Decodable {
+    let processorClass: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case processorClass = "processor_class"
+    }
+}
+
+private enum ProcessorConfigurationCodingKey: String, CodingKey {
+    case processorClass = "processor_class"
+}
+
+private func missingProcessorTypeError(filename: String) -> ProcessorConfigError {
+    ProcessorConfigError(
+        filename: filename,
+        underlying: DecodingError.keyNotFound(
+            ProcessorConfigurationCodingKey.processorClass,
+            DecodingError.Context(
+                codingPath: [],
+                debugDescription:
+                    "No processor_class was declared and no processor loading resolver supplied one."
+            )))
+}
+
+private func readProcessorConfig(from url: URL) throws -> LoadedVLMProcessorConfiguration {
     do {
         let data = try Data(contentsOf: url)
-        let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
-        return (data, config)
+        let config = try JSONDecoder.json5().decode(DeclaredProcessorConfiguration.self, from: data)
+        return LoadedVLMProcessorConfiguration(
+            data: data,
+            processorType: config.processorClass,
+            filename: url.lastPathComponent)
     } catch {
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
     }

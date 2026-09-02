@@ -7,6 +7,7 @@ import Foundation
 public struct JSONToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
 
     public init(startTag: String, endTag: String) {
         self.startTag = startTag
@@ -29,28 +30,29 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard
-            let data = jsonStr.data(using: .utf8),
-            let toolCall = parseToolCall(from: data)
-        else { return nil }
+        return parseToolCall(from: jsonStr) ?? parseRedundantOuterBraces(from: jsonStr)
+    }
 
-        // If tool schemas are provided, only accept calls to declared tools.
-        if let tools, !tools.isEmpty {
-            var isDeclaredTool = false
-            for tool in tools {
-                let functionSpec = tool["function"] as? [String: any Sendable]
-                if functionSpec?["name"] as? String == toolCall.function.name {
-                    isDeclaredTool = true
-                    break
-                }
-            }
-
-            guard isDeclaredTool else {
-                return nil
-            }
+    /// Some Qwen chat templates emit an EOS-delimited JSON call with a
+    /// redundant leading brace and two redundant closing braces.
+    /// Recover only that exact shape and only when the enclosed prefix is one
+    /// complete, valid tool-call object followed solely by those braces.
+    private func parseRedundantOuterBraces(from text: String) -> ToolCall? {
+        guard text.hasPrefix("{{") else { return nil }
+        let withoutLeadingBrace = String(text.dropFirst())
+        guard let split = jsonObjectScanner.splitLeadingObject(from: withoutLeadingBrace) else {
+            return nil
         }
+        let trailing = split.trailing.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trailing == "}}" else {
+            return nil
+        }
+        return parseToolCall(from: split.object)
+    }
 
-        return toolCall
+    private func parseToolCall(from text: String) -> ToolCall? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return parseToolCall(from: data)
     }
 
     private func parseToolCall(from data: Data) -> ToolCall? {

@@ -27,7 +27,7 @@ public protocol DraftModel {
     ) -> (tokens: MLXArray, logits: MLXArray)
 
     /// Create a fresh KV cache for the draft model
-    func newCache() -> [KVCache]
+    func newCache() throws -> [KVCache]
 
     /// Prefill the draft model's KV cache with tokens.
     /// For MLX models this runs a forward pass; for CoreML it fills stateful cache.
@@ -80,8 +80,8 @@ public class MLXDraftModel: DraftModel {
         return (tokens, logits)
     }
 
-    public func newCache() -> [KVCache] {
-        model.newCache(parameters: nil)
+    public func newCache() throws -> [KVCache] {
+        try model.newCache(parameters: nil)
     }
 
     public func prefill(tokens: MLXArray, cache: [KVCache]) {
@@ -264,13 +264,13 @@ public class SpeculativeGenerator {
         promptTokens: MLXArray,
         stopTokens: Set<Int> = [],
         callback: (Int, SpeculativeStats) -> Bool
-    ) -> SpeculativeStats {
+    ) throws -> SpeculativeStats {
         var stats = SpeculativeStats()
         stats.promptTokens = promptTokens.size
 
         // Create KV caches
-        let targetCache = targetModel.newCache(parameters: nil)
-        let draftCache = draftModel.newCache()
+        let targetCache = try targetModel.newCache(parameters: nil)
+        let draftCache = try draftModel.newCache()
 
         let sampler =
             config.temperature == 0

@@ -781,9 +781,16 @@ public struct LFM2VLProcessor: UserInputProcessor {
             totalImageTokens += h * w
         }
 
-        // Replace image placeholder tokens with the correct count
-        // image_token_id is 396 for LFM2 VL models
-        let imageTokenId = 396
+        // Replace image placeholder tokens with the correct count.
+        //
+        // The id is per-model, not per-family: 396 is LFM2-VL's, while
+        // LFM2.5-VL-3B declares 124907. Hardcoding it meant the expansion below
+        // scanned for a token the template never emitted, left the single
+        // placeholder in place, and the model then aborted the process in
+        // `mergeInputIdsWithImageFeatures` with "tokens: 1, features 1536".
+        // The vocabulary is the authority; the old constant stays as the
+        // fallback for a tokenizer with no `<image>` entry.
+        let imageTokenId = tokenizer.convertTokenToId("<image>") ?? 396
         var newPromptTokens = [Int]()
         var imageIdx = 0
         var i = 0
@@ -980,7 +987,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -1036,22 +1043,18 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask: pixelAttentionMask
         )
 
-        let result = withPreparedCache(cache, lengths: input.text.sequenceLengths) {
-            let prefillStepSize = windowSize ?? 512
+        let result = try withPreparedCache(cache, lengths: input.text.sequenceLengths) {
             let totalPositions = inputEmbeddings.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-                let range = processed ..< (processed + chunkLength)
+            let processed = try prefill.forEachChunk(total: totalPositions) { range in
                 _ = languageModel(
                     nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., range, 0...])
                 asyncEval(cache)
-                processed += chunkLength
             }
-            eval(cache)
+            if processed > 0 { eval(cache) }
 
             let result = languageModel(
                 nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., processed..., 0...])
+            prefill.progress?(totalPositions, totalPositions)
             return result
         }
 
@@ -1114,11 +1117,11 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         return sanitizedWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         let textConfig = config.textConfiguration
-        return (0 ..< textConfig.hiddenLayers).map { layerIdx in
+        return try (0 ..< textConfig.hiddenLayers).map { layerIdx in
             if textConfig.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
+                try makeAttentionKVCache(parameters: parameters)
             } else {
                 MambaCache()
             }
@@ -1309,4 +1312,10 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
         case _maxTiles = "max_tiles"
         case _downsampleFactor = "downsample_factor"
     }
+}
+
+// MARK: - Chat conventions
+
+extension LFM2VL {
+    public var toolCallFormat: ToolCallFormat? { .lfm2 }
 }

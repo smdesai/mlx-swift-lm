@@ -372,20 +372,22 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
         self.kvHeads = Array(repeating: config.kvHeads, count: config.hiddenLayers)
     }
 
-    /// Creates appropriate cache types for each layer
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        var caches: [any KVCache] = []
+    /// Creates appropriate cache types for each layer.
+    /// Global layers honor caller-requested capacity. Local layers retain the
+    /// architecture sliding window for typed requests and are capped by legacy
+    /// ``GenerateParameters/maxKVSize``.
+    public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
         let slidingWindow = config.slidingWindow > 0 ? config.slidingWindow : 4096
         let slidingWindowPattern = config.slidingWindowPattern
-        for i in 0 ..< config.hiddenLayers {
+        return try (0 ..< config.hiddenLayers).map { i in
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
             if isGlobalLayer {
-                caches.append(StandardKVCache())
+                return try makeAttentionKVCache(parameters: parameters)
             } else {
-                caches.append(RotatingKVCache(maxSize: slidingWindow, keep: 0))
+                return try makeSlidingWindowKVCache(
+                    parameters: parameters, window: slidingWindow)
             }
         }
-        return caches
     }
 
     func callAsFunction(
@@ -890,8 +892,8 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
     public var kvHeads: [Int] { languageModel.kvHeads }
 
     /// Create cache with proper types for each layer
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        return languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
+        return try languageModel.newCache(parameters: parameters)
     }
 
     public init(_ config: Gemma3Configuration) {
@@ -983,29 +985,25 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
-        let prefillStepSize = windowSize ?? 512
         let convertedCache = cache.compactMap { $0 as KVCache }
 
         guard let imagePixels = input.image?.pixels else {
             var tokens = input.text.tokens
             if tokens.ndim == 1 { tokens = tokens.expandedDimensions(axis: 0) }
             let totalPositions = tokens.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+            let processed = try prefill.forEachChunk(total: totalPositions) { range in
                 _ = languageModel(
-                    tokens[0..., processed ..< (processed + chunkLength)],
-                    cache: convertedCache, inputEmbedding: nil, mask: nil)
+                    tokens[0..., range], cache: convertedCache, inputEmbedding: nil, mask: nil)
                 asyncEval(cache)
-                processed += chunkLength
             }
-            eval(cache)
+            if processed > 0 { eval(cache) }
             let result = languageModel(
                 tokens[0..., processed...], cache: convertedCache, inputEmbedding: nil, mask: nil)
+            prefill.progress?(totalPositions, totalPositions)
             return .logits(result)
         }
 
@@ -1017,20 +1015,17 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
 
         let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = .causal
         let totalPositions = inputEmbeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(
                 nil, cache: convertedCache,
                 inputEmbedding: inputEmbeddings[0..., range, 0...], mask: maskMode)
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let result = languageModel(
             nil, cache: convertedCache,
             inputEmbedding: inputEmbeddings[0..., processed..., 0...], mask: maskMode)
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
     }
 
