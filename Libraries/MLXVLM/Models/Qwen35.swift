@@ -1283,6 +1283,22 @@ public class Qwen35: Module, VLMModel {
         return cache.indices.contains(faIdx) ? cache[faIdx].offset : 0
     }
 
+    /// Per-row positions for text-only batches, which carry no rope-delta state.
+    /// Without images M-RoPE is plain RoPE, so this matches the MLXLLM model.
+    private func textBatchPositionIds(
+        _ tokens: MLXArray, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> MLXArray? {
+        let faIdx = languageModel.model.faIdx
+        guard state?[ropeDeltasKey] == nil, let cache, cache.indices.contains(faIdx),
+            let batchCache = cache[faIdx] as? BatchPositionedKVCache
+        else { return nil }
+        let tokens = tokens.ndim == 1 ? tokens[.newAxis, 0...] : tokens
+        let (batchSize, seqLength) = (tokens.dim(0), tokens.dim(1))
+        let base = MLXArray(0 ..< Int32(seqLength))[.newAxis, 0...]
+        let positions = batchCache.batchOffset.asType(.int32)[0..., .newAxis] + base
+        return broadcast(positions[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+    }
+
     /// Warm, windowed continuation through an image-bearing remainder — the
     /// windowed forward that `prepare` also delegates to for long prompts.
     ///
@@ -1387,8 +1403,10 @@ public class Qwen35: Module, VLMModel {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        let batchPositionIds = textBatchPositionIds(input.tokens, cache: cache, state: state)
         precondition(
-            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil
+                || batchPositionIds != nil,
             "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
         let typedCache = castCacheOptional(cache)
         let result = languageModel(
@@ -1397,7 +1415,7 @@ public class Qwen35: Module, VLMModel {
             cache: typedCache,
             state: state,
             mask: nil,
-            positionIds: nil,
+            positionIds: batchPositionIds,
             pixelValues: nil,
             imageGridTHW: nil,
             videoGridTHW: nil
