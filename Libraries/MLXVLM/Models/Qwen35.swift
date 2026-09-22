@@ -1283,20 +1283,15 @@ public class Qwen35: Module, VLMModel {
         return cache.indices.contains(faIdx) ? cache[faIdx].offset : 0
     }
 
-    /// Per-row positions for text-only batches, which carry no rope-delta state.
-    /// Without images M-RoPE is plain RoPE, so this matches the MLXLLM model.
+    /// Per-row positions for text-only batches (see ``QwenVL/textBatchPositionIds(_:cache:)``).
     private func textBatchPositionIds(
         _ tokens: MLXArray, cache: [any KVCache]?, state: LMOutput.State?
     ) -> MLXArray? {
         let faIdx = languageModel.model.faIdx
-        guard state?[ropeDeltasKey] == nil, let cache, cache.indices.contains(faIdx),
-            let batchCache = cache[faIdx] as? BatchPositionedKVCache
-        else { return nil }
-        let tokens = tokens.ndim == 1 ? tokens[.newAxis, 0...] : tokens
-        let (batchSize, seqLength) = (tokens.dim(0), tokens.dim(1))
-        let base = MLXArray(0 ..< Int32(seqLength))[.newAxis, 0...]
-        let positions = batchCache.batchOffset.asType(.int32)[0..., .newAxis] + base
-        return broadcast(positions[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+        guard state?[ropeDeltasKey] == nil, let cache, cache.indices.contains(faIdx) else {
+            return nil
+        }
+        return QwenVL.textBatchPositionIds(tokens, cache: cache[faIdx])
     }
 
     /// Warm, windowed continuation through an image-bearing remainder — the

@@ -1150,10 +1150,15 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        let batchPositionIds =
+            state?[ropeDeltasKey] == nil
+            ? QwenVL.textBatchPositionIds(input.tokens, cache: cache?.first) : nil
         precondition(
-            (cache?.first?.offset ?? 0) == 0 || state?[ropeDeltasKey] != nil,
+            (cache?.first?.offset ?? 0) == 0 || state?[ropeDeltasKey] != nil
+                || batchPositionIds != nil,
             "GlmOcr cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
-        return languageModel(input.tokens, cache: cache, state: state)
+        return languageModel(
+            input.tokens, cache: cache, state: state, positionIds: batchPositionIds)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

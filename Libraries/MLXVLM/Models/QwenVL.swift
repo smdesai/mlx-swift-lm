@@ -52,6 +52,18 @@ public struct QwenVL {
         return resumeState
     }
 
+    /// M-RoPE position ids `[3, B, L]` for a text-only batch, taken from the per-row offsets of
+    /// `cache`. Batches carry no rope-delta state, and without images M-RoPE is plain RoPE.
+    /// Returns nil unless `cache` is a ``BatchPositionedKVCache``.
+    static func textBatchPositionIds(_ tokens: MLXArray, cache: KVCache?) -> MLXArray? {
+        guard let batchCache = cache as? BatchPositionedKVCache else { return nil }
+        let tokens = tokens.ndim == 1 ? tokens[.newAxis, 0...] : tokens
+        let (batchSize, seqLength) = (tokens.dim(0), tokens.dim(1))
+        let base = MLXArray(0 ..< Int32(seqLength))[.newAxis, 0...]
+        let positions = batchCache.batchOffset.asType(.int32)[0..., .newAxis] + base
+        return broadcast(positions[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+    }
+
     /// Rotates half the hidden dims of the input
     static func rotateHalf(_ x: MLXArray) -> MLXArray {
         let index = x.dim(-1) / 2

@@ -1284,9 +1284,13 @@ enum Qwen3VLLanguage {
                 fatalError("Either input ids or embeddings must be provided")
             }
 
+            // The single-cache overload lets batch caches mask their left padding.
             var mask = mask
-            if mask == nil {
-                mask = createAttentionMask(h: hidden, cache: cache)
+            if mask == nil,
+                case .array(let causal) = createAttentionMask(
+                    h: hidden, cache: cache?.first, returnArray: true)
+            {
+                mask = causal
             }
 
             // Loop-invariant: the scatter targets the same token positions in
@@ -1960,8 +1964,12 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        let batchPositionIds =
+            state?[ropeDeltasKey] == nil
+            ? QwenVL.textBatchPositionIds(input.tokens, cache: cache?.first) : nil
         precondition(
-            (cache?.first?.offset ?? 0) == 0 || state?[ropeDeltasKey] != nil,
+            (cache?.first?.offset ?? 0) == 0 || state?[ropeDeltasKey] != nil
+                || batchPositionIds != nil,
             "Qwen3VL cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
         let typedCache = castCacheOptional(cache)
 
@@ -1971,7 +1979,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             state: state,
             inputEmbeddings: nil,
             mask: nil,
-            positionIds: nil,
+            positionIds: batchPositionIds,
             visualIndices: nil,
             deepstackEmbeds: nil,
             pixelValues: nil,
