@@ -186,9 +186,8 @@ public class GLM4Model: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         return weights
     }
@@ -276,4 +275,10 @@ extension GLM4Model: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension GLM4Model {
+    public var toolCallFormat: ToolCallFormat? { .glm4 }
 }

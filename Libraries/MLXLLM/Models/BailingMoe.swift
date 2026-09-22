@@ -263,7 +263,7 @@ class BailingMoeSparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, weights) = gate.groupSelect(x)
         var out = switchMLP(x, inds)
-        out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        out = weightedExpertSum(out, weights)
         if let shared = sharedExperts {
             out = out + shared(x)
         }
@@ -355,6 +355,11 @@ public class BailingMoeModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             return model.embedTokens.asLinear(out)
         }
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
     }
 }
 

@@ -130,7 +130,7 @@ class MiniMaxSparseMoeBlock: Module {
         scores = scores.asType(x.dtype)
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return weightedExpertSum(y, scores)
     }
 }
 
@@ -221,9 +221,8 @@ public class MiniMaxModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitizedWeights = weights
 
-        if configuration.tieWordEmbeddings {
-            sanitizedWeights["lm_head.weight"] = nil
-        }
+        sanitizedWeights = filterLMHeadWeights(
+            from: sanitizedWeights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
             let dtype = weight.dtype
