@@ -43,6 +43,13 @@ struct BatchGenerate: AsyncParsableCommand {
     @Flag(name: .long, help: "Disable thinking mode for models that support it (e.g. Qwen3)")
     var noThink: Bool = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Always load the text-only (MLXLLM) model, even for a single prompt. Batches prefer it automatically"
+    )
+    var textOnly: Bool = false
+
     /// Build additionalContext to control thinking mode in the chat template.
     /// When --no-think is set, passes "enable_thinking": false to disable
     /// thinking for models like Qwen3 that default to thinking enabled.
@@ -101,13 +108,29 @@ struct BatchGenerate: AsyncParsableCommand {
 
         // Load model
         printErr("Loading model: \(modelId)")
-        let context = try await loadModel(
-            from: HubDownloader(),
-            using: HFTokenizerLoader(),
-            id: modelId
-        ) { progress in
+        let progressHandler: @Sendable (Progress) -> Void = { progress in
             let pct = Int(progress.fractionCompleted * 100)
             printErr("\rDownloading model... \(pct)%", terminator: "")
+        }
+        // The registry always tries VLM first. Batches are text-only, and some VLMs
+        // (e.g. Qwen3.5) cannot batch, so prefer the LLM model and fall back if it can't load.
+        let context: ModelContext
+        if textOnly || prompts.count > 1 {
+            do {
+                context = try await LLMModelFactory.shared.load(
+                    from: HubDownloader(), using: HFTokenizerLoader(),
+                    configuration: .init(id: modelId), progressHandler: progressHandler)
+            } catch where !textOnly {
+                printErr(
+                    "\nNo text-only model (\(error.localizedDescription)), trying all factories")
+                context = try await loadModel(
+                    from: HubDownloader(), using: HFTokenizerLoader(),
+                    id: modelId, progressHandler: progressHandler)
+            }
+        } else {
+            context = try await loadModel(
+                from: HubDownloader(), using: HFTokenizerLoader(),
+                id: modelId, progressHandler: progressHandler)
         }
         printErr("")  // newline after progress
         printErr("Model loaded.")
