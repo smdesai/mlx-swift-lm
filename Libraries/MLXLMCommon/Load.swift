@@ -384,6 +384,9 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    try (model as? any PackedModuleInstalling)?.installPackedModules(
+        weights: &weights, modelDirectory: modelDirectory)
+
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
         quantize(model: model) { path, module in

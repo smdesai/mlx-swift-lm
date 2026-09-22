@@ -208,6 +208,8 @@ public struct Qwen35Configuration: Codable, Sendable {
     public var vocabSize: Int { _vocabSize ?? textConfiguration.vocabularySize }
     private let _eosTokenId: IntOrIntArray?
     public var eosTokenId: [Int]? { _eosTokenId?.values }
+    /// Hadamard metadata file of a PrismML `prism_hadamard_qwen35` checkpoint.
+    public let hadamardConfig: String?
 
     enum CodingKeys: String, CodingKey {
         case textConfiguration = "text_config"
@@ -222,6 +224,7 @@ public struct Qwen35Configuration: Codable, Sendable {
         case _visionEndTokenId = "vision_end_token_id"
         case _vocabSize = "vocab_size"
         case _eosTokenId = "eos_token_id"
+        case hadamardConfig = "hadamard_config"
     }
 }
 

@@ -37,6 +37,16 @@ public protocol AdditionalWeightFilesProviding {
     var additionalWeightFiles: [String] { get }
 }
 
+/// A model that builds some of its modules directly from checkpoint tensors.
+///
+/// `loadWeights` calls this after `sanitize(weights:metadata:)` and before quantization, so
+/// layers installed here (e.g. Hadamard-folded projections) are not quantized again. Tensors
+/// left in `weights` are applied by the normal parameter update afterwards; remove any the
+/// installed modules do not hold as parameters.
+public protocol PackedModuleInstalling {
+    func installPackedModules(weights: inout [String: MLXArray], modelDirectory: URL) throws
+}
+
 /// Optional metadata a model wants written into converted safetensors.
 ///
 /// Model-specific metadata lets future loaders distinguish transformed MLX-native
