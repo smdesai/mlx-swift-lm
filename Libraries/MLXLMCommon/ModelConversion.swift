@@ -652,6 +652,9 @@ private func quantizeForModelConversion(
         }
 
     model.update(modules: ModuleChildren.unflattened(updates))
+    // Quantized layers replace their float counterparts; drop traces of the
+    // old tree.
+    model.invalidateCompiledTraces()
 
     return .init(
         defaultQuantization: effectiveDefaultQuantization.asModelConversionQuantization,
