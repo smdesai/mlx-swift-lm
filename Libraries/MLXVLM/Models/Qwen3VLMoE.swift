@@ -398,9 +398,13 @@ enum Qwen3VLMoELanguage {
                 fatalError("Either input ids or embeddings must be provided")
             }
 
+            // The single-cache overload lets batch caches mask their left padding.
             var mask = mask
-            if mask == nil {
-                mask = createAttentionMask(h: hidden, cache: cache)
+            if mask == nil,
+                case .array(let causal) = createAttentionMask(
+                    h: hidden, cache: cache?.first, returnArray: true)
+            {
+                mask = causal
             }
 
             for (index, layer) in layers.enumerated() {
@@ -736,6 +740,9 @@ public final class Qwen3VLMoE: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        let batchPositionIds =
+            state?[qwen3VLMoERopeDeltasKey] == nil
+            ? QwenVL.textBatchPositionIds(input.tokens, cache: cache?.first) : nil
         let typedCache = castCacheOptional(cache)
 
         return languageModel(
@@ -744,7 +751,7 @@ public final class Qwen3VLMoE: Module, VLMModel, KVCacheDimensionProvider {
             state: state,
             inputEmbeddings: nil,
             mask: nil,
-            positionIds: nil,
+            positionIds: batchPositionIds,
             visualMask: nil,
             deepstackEmbeds: nil,
             pixelValues: nil,
