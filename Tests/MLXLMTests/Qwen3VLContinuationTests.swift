@@ -135,7 +135,7 @@ final class Qwen3VLContinuationTests: XCTestCase {
                     prefill: .init()))
 
             XCTAssertLessThanOrEqual(
-                maxAbsDiff(warmLogits, fullLogits), 1e-3,
+                maxAbsDiff(warmLogits, fullLogits), MatmulPrecision.splitTolerance,
                 "rank-1 warm continuation diverged from full prefill")
         }
     }
@@ -144,6 +144,12 @@ final class Qwen3VLContinuationTests: XCTestCase {
     /// carried into turn 2's prefill.
     func testWarmImageContinuationMatchesFullPrefill() throws {
         try continuation.assertWarmImageContinuation(try makeTinyModel())
+    }
+
+    /// The only test that exercises deepstack across a split boundary: the suffix's vision
+    /// run must regenerate per-layer deepstack rows for exactly the retained image.
+    func testSplitMediaSuffixContinuationMatchesFullPrefill() throws {
+        try continuation.assertSplitMediaSuffixContinuation(try makeTinyModel())
     }
 
     /// An image in the middle turn: the continuation must both place the new
@@ -231,7 +237,7 @@ final class Qwen3VLContinuationTests: XCTestCase {
                 model.prepare(input, cache: windowedCache, state: nil, prefill: .init(stepSize: 8)))
 
             XCTAssertLessThanOrEqual(
-                maxAbsDiff(windowedLogits, singleLogits), 1e-3,
+                maxAbsDiff(windowedLogits, singleLogits), MatmulPrecision.splitTolerance,
                 "padding changed Qwen3-VL windowed M-RoPE semantics")
         }
     }

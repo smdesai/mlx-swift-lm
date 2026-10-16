@@ -6,15 +6,28 @@ import MLXNN
 
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
+    /// Serialized namespaces whose tensors this model never loads, such as the target model in
+    /// a checkpoint that a drafter shares with it. The loader does not read them.
+    ///
+    /// Namespaces match whole dot-separated prefixes of the names before
+    /// ``prepareCheckpoint(_:)``. The default is empty.
+    var excludedCheckpointNamespaces: [String] { get }
+
+    /// Normalize tensor names, values, and layer settings before loading the checkpoint.
+    /// The default implementation calls ``sanitize(weights:metadata:)``.
+    func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint
+
     /// Optionally preprocess the weights and modify / remove values as needed.
-    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
+    /// Errors propagate to the checkpoint loader.
+    func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray]
 
     /// Optionally preprocess the weights with access to safetensor metadata.
     ///
     /// The default implementation forwards to ``sanitize(weights:)``.
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
-    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
+        MLXArray]
 }
 
 /// Weight files a model needs that no naming convention or `model.safetensors.index.json`
@@ -46,14 +59,23 @@ public protocol ModelConversionMetadataProvider {
 }
 
 extension BaseLanguageModel {
+    public var excludedCheckpointNamespaces: [String] { [] }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = checkpoint
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
     }
 
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
         MLXArray]
     {
-        sanitize(weights: weights)
+        try sanitize(weights: weights)
     }
 }
 
@@ -346,6 +368,14 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
 
+    /// Evaluate all input positions when only the final position's logits are needed.
+    ///
+    /// Implementations may omit earlier logit rows, but must preserve cache updates and
+    /// output state. The default uses the regular forward. Scoring and speculative
+    /// verification must use the regular forward when they need multiple positions.
+    func nextTokenLogits(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        -> LMOutput
+
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
 
@@ -375,6 +405,12 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 }
 
 extension LanguageModel {
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        callAsFunction(input, cache: cache, state: state)
+    }
+
     /// Most language models have no derived inference state to prepare.
     public func prepare() throws {}
 
@@ -434,4 +470,21 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
     // commonly conform to ``KVCacheDimensionProvider`` while overriding ``newCache``;
     // a kvHeads-based default would mis-report those layouts. The base
     // ``LanguageModel`` implementation classifies the caches ``newCache`` builds.
+}
+
+/// Optional capability for language models whose forward pass is a final-hidden-state
+/// stack followed by a vocabulary projection.
+///
+/// Callers can select positions before projecting, for example to score only the last
+/// token of each row. The model keeps ownership of normalization, masking, and the cache;
+/// pass ragged batches through ``withPreparedCache(_:lengths:_:)`` as for any forward pass.
+package protocol HiddenStateLanguageModel: LanguageModel {
+    /// Returns final, normalized hidden states `[batch, sequence, hidden]`.
+    func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+
+    /// Projects hidden states `[..., hidden]` to vocabulary logits `[..., vocabulary]`.
+    ///
+    /// Include any logit scaling or soft-capping, so that projecting all positions gives the
+    /// same logits as ``LanguageModel/callAsFunction(_:cache:)``.
+    func projectLogits(_ hiddenStates: MLXArray) -> MLXArray
 }
