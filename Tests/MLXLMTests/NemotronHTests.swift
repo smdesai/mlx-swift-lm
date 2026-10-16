@@ -185,6 +185,36 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(config.routedScalingFactor, 1.0)
     }
 
+    func testConfigurationDecodingDenseWithoutMoEKeys() throws {
+        // A dense checkpoint (e.g. NVIDIA-Nemotron-3-Nano-4B) has no "E" layers and
+        // ships none of the MoE keys; it must still decode, and build a model.
+        let json = """
+            {
+                "vocab_size": 100,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "mamba_num_heads": 4,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 16,
+                "conv_kernel": 4,
+                "n_groups": 2,
+                "intermediate_size": 128,
+                "hybrid_override_pattern": "M-M*"
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            NemotronHConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(config.moeIntermediateSize, 0)
+        XCTAssertEqual(config.moeSharedExpertIntermediateSize, 0)
+        XCTAssertEqual(config.nRoutedExperts, 0)
+        XCTAssertEqual(config.numExpertsPerTok, 0)
+        _ = NemotronHModel(config)  // no MoE layer is built, so no expert count is needed
+    }
+
     // MARK: - Weight Sanitization Tests
 
     func testSanitizeConv1dWeights() throws {
@@ -233,14 +263,12 @@ public class NemotronHTests: XCTestCase {
         let model = NemotronHModel(config)
 
         // Create mock expert weights that need stacking
-        let nRoutedExperts = try XCTUnwrap(config.nRoutedExperts)
-        let moeIntermediateSize = try XCTUnwrap(config.moeIntermediateSize)
         var weights = [String: MLXArray]()
-        for e in 0 ..< nRoutedExperts {
+        for e in 0 ..< config.nRoutedExperts {
             weights["backbone.layers.0.mixer.experts.\(e).up_proj.weight"] =
-                MLXArray.ones([moeIntermediateSize, config.hiddenSize])
+                MLXArray.ones([config.moeIntermediateSize, config.hiddenSize])
             weights["backbone.layers.0.mixer.experts.\(e).down_proj.weight"] =
-                MLXArray.ones([config.hiddenSize, moeIntermediateSize])
+                MLXArray.ones([config.hiddenSize, config.moeIntermediateSize])
         }
 
         let sanitized = model.sanitize(weights: weights)

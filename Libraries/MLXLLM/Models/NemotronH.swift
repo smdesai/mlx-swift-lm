@@ -421,14 +421,14 @@ private class NemotronHMoEGate: Module {
     @ParameterInfo(key: "e_score_correction_bias") var eSCB: MLXArray
 
     init(_ args: NemotronHConfiguration) {
-        self.topK = args.numExpertsPerTok!
+        self.topK = args.numExpertsPerTok
         self.nGroup = args.nGroup
         self.topkGroup = args.topkGroup
         self.routedScalingFactor = args.routedScalingFactor
         self.normTopkProb = args.normTopkProb
 
-        self._weight.wrappedValue = MLXArray.zeros([args.nRoutedExperts!, args.hiddenSize])
-        self._eSCB.wrappedValue = MLXArray.zeros([args.nRoutedExperts!])
+        self._weight.wrappedValue = MLXArray.zeros([args.nRoutedExperts, args.hiddenSize])
+        self._eSCB.wrappedValue = MLXArray.zeros([args.nRoutedExperts])
 
         super.init()
     }
@@ -505,14 +505,14 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
 
     init(_ args: NemotronHConfiguration) {
-        self.numExpertsPerTok = args.numExpertsPerTok!
+        self.numExpertsPerTok = args.numExpertsPerTok
         self.hasSharedExperts = args.nSharedExperts != nil && args.nSharedExperts! > 0
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
         self._switchMLP.wrappedValue = NemotronHSwitchMLP(
             inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize!,
-            numExperts: args.nRoutedExperts!
+            hiddenDims: args.moeIntermediateSize,
+            numExperts: args.nRoutedExperts
         )
 
         if hasSharedExperts {
@@ -771,17 +771,15 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         }
 
         // Stack experts: backbone.layers.{l}.mixer.experts.{e}.{proj}.weight -> backbone.layers.{l}.mixer.switch_mlp.{proj}.weight
-        if let nRoutedExperts = configuration.nRoutedExperts {
-            for l in 0 ..< configuration.numHiddenLayers {
-                let prefix = "backbone.layers.\(l).mixer"
-                for (m, n) in [("down_proj", "fc2"), ("up_proj", "fc1")] {
-                    if sanitized["\(prefix).experts.0.\(m).weight"] != nil {
-                        let toJoin = (0 ..< nRoutedExperts).compactMap { e in
-                            sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(m).weight")
-                        }
-                        if !toJoin.isEmpty {
-                            sanitized["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
-                        }
+        for l in 0 ..< configuration.numHiddenLayers {
+            let prefix = "backbone.layers.\(l).mixer"
+            for (m, n) in [("down_proj", "fc2"), ("up_proj", "fc1")] {
+                if sanitized["\(prefix).experts.0.\(m).weight"] != nil {
+                    let toJoin = (0 ..< configuration.nRoutedExperts).compactMap { e in
+                        sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(m).weight")
+                    }
+                    if !toJoin.isEmpty {
+                        sanitized["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
                     }
                 }
             }
@@ -815,11 +813,11 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var convKernel: Int
     public var nGroups: Int
     public var intermediateSize: Int
-    public var moeIntermediateSize: Int?
-    public var moeSharedExpertIntermediateSize: Int?
-    public var nRoutedExperts: Int?
+    public var moeIntermediateSize: Int
+    public var moeSharedExpertIntermediateSize: Int
+    public var nRoutedExperts: Int
     public var nSharedExperts: Int?
-    public var numExpertsPerTok: Int?
+    public var numExpertsPerTok: Int
     public var hybridOverridePattern: String
     public var layerNormEpsilon: Float
     public var mlpBias: Bool
@@ -888,12 +886,18 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel = try container.decode(Int.self, forKey: .convKernel)
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
-        moeIntermediateSize = try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize)
-        moeSharedExpertIntermediateSize = try container.decodeIfPresent(
-            Int.self, forKey: .moeSharedExpertIntermediateSize)
-        nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts)
+        // Dense Nemotron-H checkpoints (e.g. NVIDIA-Nemotron-3-Nano-4B) have no "E"
+        // layers in hybrid_override_pattern and ship no MoE keys at all, so these
+        // are only required when an MoE layer will actually be built.
+        moeIntermediateSize =
+            try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
+        moeSharedExpertIntermediateSize =
+            try container.decodeIfPresent(
+                Int.self, forKey: .moeSharedExpertIntermediateSize) ?? 0
+        nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts) ?? 0
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
-        numExpertsPerTok = try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok)
+        numExpertsPerTok =
+            try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 0
         layerNormEpsilon =
             try container.decodeIfPresent(Float.self, forKey: .layerNormEpsilon) ?? 1e-5
         mlpBias = try container.decodeIfPresent(Bool.self, forKey: .mlpBias) ?? false
@@ -965,10 +969,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel: Int,
         nGroups: Int,
         intermediateSize: Int,
-        moeIntermediateSize: Int? = nil,
-        moeSharedExpertIntermediateSize: Int? = nil,
-        nRoutedExperts: Int? = nil,
-        numExpertsPerTok: Int? = nil,
+        moeIntermediateSize: Int,
+        moeSharedExpertIntermediateSize: Int,
+        nRoutedExperts: Int,
+        numExpertsPerTok: Int,
         hybridOverridePattern: String,
         layerNormEpsilon: Float = 1e-5,
         attentionBias: Bool = false,
