@@ -138,6 +138,14 @@ private func extractCacheEntry(_ cache: KVCache, at index: Int) -> KVCache {
         return batchCache.extract(at: index)
     } else if let batchRotatingCache = cache as? BatchRotatingKVCache {
         return batchRotatingCache.extract(at: index)
+    } else if let arraysCache = cache as? ArraysCache {
+        // copy() keeps the subclass (e.g. MambaCache); keep only this sequence's row.
+        // Padding describes the batch layout, so the single-sequence cache drops it.
+        let extracted = arraysCache.copy() as! ArraysCache
+        extracted.filter(batchIndices: MLXArray([Int32(index)]))
+        extracted.leftPadding = nil
+        extracted.lengths = nil
+        return extracted
     }
     return cache
 }
@@ -348,7 +356,13 @@ public class BatchGenerator {
                 if let batchCache = c as? BatchKVCache {
                     batchCache.prepare(lengths: lengths, rightPadding: padding)
                 } else if let batchRotatingCache = c as? BatchRotatingKVCache {
-                    batchRotatingCache.prepare(lengths: lengths, rightPadding: padding)
+                    // The rotating cache rolls by offset - lengths, so it needs the prefilled
+                    // lengths: the last token is fed again below as the first decode input.
+                    batchRotatingCache.prepare(
+                        lengths: lengths.map { $0 - 1 }, rightPadding: padding)
+                } else if let arraysCache = c as? ArraysCache {
+                    // Recurrent and conv state must stop at each prompt's last prefilled token.
+                    arraysCache.prepare(lengths: lengths.map { $0 - 1 })
                 }
             }
 
@@ -370,6 +384,8 @@ public class BatchGenerator {
                     batchCache.finalize()
                 } else if let batchRotatingCache = c as? BatchRotatingKVCache {
                     batchRotatingCache.finalize()
+                } else if let arraysCache = c as? ArraysCache {
+                    arraysCache.finalize()
                 }
             }
             eval(promptCache.flatMap { $0.innerState() })
@@ -399,7 +415,7 @@ public class BatchGenerator {
         return Batch(
             uids: uids,
             y: y,
-            logprobs: Array(repeating: logprobs, count: uids.count),
+            logprobs: (0 ..< uids.count).map { logprobs[$0] },
             maxTokens: maxTokens,
             numTokens: Array(repeating: 0, count: uids.count),
             cache: promptCache
@@ -427,8 +443,8 @@ public class BatchGenerator {
             return CacheList(array: mergedSubCaches)
         } else if layerCaches[0] is KVCacheSimple {
             return BatchKVCache.merge(layerCaches.compactMap { $0 as? KVCacheSimple })
-        } else if let rotating = layerCaches[0] as? RotatingKVCache {
-            return BatchRotatingKVCache(maxSize: rotating.maxSize ?? 4096, leftPadding: [])
+        } else if layerCaches[0] is RotatingKVCache {
+            return BatchRotatingKVCache.merge(layerCaches.compactMap { $0 as? RotatingKVCache })
         } else if layerCaches[0] is MambaCache {
             // Merge MambaCache instances by concatenating states along batch dimension (axis 0)
             let merged = MambaCache()
@@ -585,7 +601,7 @@ public class BatchGenerator {
 
         // Update batch state
         batch.y = nextY
-        batch.logprobs = (0 ..< batch.count).map { _ in nextLogprobs }
+        batch.logprobs = (0 ..< batch.count).map { nextLogprobs[$0] }
 
         // Remove finished sequences
         if !keepIdx.isEmpty && keepIdx.count < batch.count {

@@ -2215,24 +2215,69 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         self.internalOffset = max(internalOffset, other.internalOffset)
     }
 
+    /// Merge individual rotating caches into a batch cache.
+    ///
+    /// Each cache's live window is laid out in temporal order and left-padded to a common
+    /// length; `batchOffset` keeps each sequence's true position for RoPE.
+    public static func merge(_ caches: [RotatingKVCache]) -> BatchRotatingKVCache {
+        let maxSize = caches[0].maxSize!
+        precondition(
+            caches.allSatisfy { $0.maxSize == maxSize },
+            "BatchRotatingKVCache can only merge caches with the same maximum size")
+
+        let views = caches.map { $0.logicalView(tail: maxSize) }
+        let lengths = views.map { $0?.0.dim(2) ?? 0 }
+        let maxLength = lengths.max()!
+        guard maxLength > 0, let first = views.compactMap({ $0 }).first else {
+            return BatchRotatingKVCache(
+                maxSize: maxSize, leftPadding: Array(repeating: 0, count: caches.count))
+        }
+        let padding = lengths.map { maxLength - $0 }
+
+        let B = caches.count
+        let H = first.0.dim(1)
+        let keys = MLXArray.zeros([B, H, maxLength, first.0.dim(3)], dtype: first.0.dtype)
+        let values = MLXArray.zeros([B, H, maxLength, first.1.dim(3)], dtype: first.1.dtype)
+        for (i, (p, view)) in zip(padding, views).enumerated() {
+            guard let view else { continue }
+            keys[i ..< (i + 1), 0..., p ..< maxLength, 0...] = view.0
+            values[i ..< (i + 1), 0..., p ..< maxLength, 0...] = view.1
+        }
+
+        let cache = BatchRotatingKVCache(maxSize: maxSize, leftPadding: padding)
+        cache.keys = keys
+        cache.values = values
+        cache.batchOffset = MLXArray(caches.map { Int32($0.offset) })
+        cache.idx = maxLength
+        cache.internalOffset = maxLength
+        return cache
+    }
+
     public func extract(at index: Int) -> RotatingKVCache {
         let cache = RotatingKVCache(maxSize: maxCacheSize)
-        let padding = Int(leftPadding[index].item(Int32.self))
+        let padding = max(0, Int(leftPadding[index].item(Int32.self)))
+        let offset = Int(batchOffset[index].item(Int32.self))
 
-        cache.keys = keys?[index ..< (index + 1)]
-        cache.values = values?[index ..< (index + 1)]
+        guard var k = keys?[index ..< (index + 1)], var v = values?[index ..< (index + 1)] else {
+            cache.offset = offset
+            return cache
+        }
 
+        // Live rows end at idx unless the ring has wrapped; the buffer past idx is unused.
+        var end = idx
         if rotated {
-            cache.keys = roll(cache.keys!, shift: -idx, axis: 2)
-            cache.values = roll(cache.values!, shift: -idx, axis: 2)
+            k = roll(k, shift: -idx, axis: 2)
+            v = roll(v, shift: -idx, axis: 2)
+            end = maxCacheSize
         }
+        cache.keys = k[.ellipsis, padding ..< end, 0...]
+        cache.values = v[.ellipsis, padding ..< end, 0...]
 
-        if padding > 0 {
-            cache.keys = cache.keys![.ellipsis, padding ..< (cache.keys!.dim(2)), 0...]
-            cache.values = cache.values![.ellipsis, padding ..< (cache.values!.dim(2)), 0...]
-        }
-
-        cache.offset = Int(batchOffset[index].item(Int32.self))
+        // Restore offset and write position: rows are now in temporal order, ending at idx.
+        cache.metaState = [
+            "0", String(maxCacheSize), "256", String(offset), String(end - padding),
+            "modelNative", "false",
+        ]
 
         return cache
     }
