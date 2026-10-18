@@ -438,6 +438,23 @@ func applyCheckpoint(_ checkpoint: ModelCheckpoint, to module: Module) throws {
             guard weights["\(path).scales"] != nil else { return nil }
             return perLayerQuantization.quantization(layer: path)?.asTuple
         }
+        // NVFP4 checkpoints can carry a per-tensor global scale. A freshly quantized layer has
+        // no slot for it, so rebuild those layers with one before the strict update fills it.
+        let scaled = module.leafModules().flattened().compactMap {
+            path, layer -> (String, Module)? in
+            guard let q = layer as? QuantizedLinear, q.globalScale == nil,
+                let globalScale = weights["\(path).global_scale"]
+            else { return nil }
+            let rebuilt = QuantizedLinear(
+                weight: q.weight, bias: q.bias, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+                globalScale: MLXArray.zeros(like: globalScale))
+            rebuilt.freeze()
+            return (path, rebuilt)
+        }
+        if !scaled.isEmpty {
+            module.update(modules: ModuleChildren.unflattened(scaled))
+        }
     }
     try module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
 }
