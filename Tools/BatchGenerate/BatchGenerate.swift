@@ -135,18 +135,13 @@ struct BatchGenerate: AsyncParsableCommand {
         printErr("")  // newline after progress
         printErr("Model loaded.")
 
-        // Models with RotatingKVCache (e.g. Gemma 3/4 sliding window attention)
-        // don't produce correct output in batch mode due to left-padding offset
-        // issues in mixed KVCacheSimple + RotatingKVCache setups.
-        // Fall back to sequential single-prompt generation for these models.
-        let sampleCache = try context.model.newCache(parameters: nil)
-        let hasRotatingCaches = sampleCache.contains { $0 is RotatingKVCache }
+        // Gemma 4 gives different results in a fresh batched prefill than one prompt at a
+        // time, so run its prompts sequentially. Other sliding-window models batch correctly.
+        let runSequentially = String(describing: type(of: context.model)).hasPrefix("Gemma4")
 
-        if prompts.count == 1 || hasRotatingCaches {
-            if hasRotatingCaches && prompts.count > 1 {
-                printErr(
-                    "Note: model uses sliding window attention, running \(prompts.count) prompts sequentially"
-                )
+        if prompts.count == 1 || runSequentially {
+            if runSequentially && prompts.count > 1 {
+                printErr("Note: running \(prompts.count) Gemma 4 prompts sequentially")
             }
             for (i, promptText) in prompts.enumerated() {
                 if prompts.count > 1 {
@@ -255,16 +250,12 @@ struct BatchGenerate: AsyncParsableCommand {
         var prefillCaches: [[KVCache]]? = nil
         var suffixTokens: [[Int]]? = nil
 
-        // Skip system prompt pre-fill for models with caches that can't be merged:
-        // - Mamba/SSM layers use recurrent state that can't be cloned like KV caches
-        // - CacheList wraps MambaCache + KVCacheSimple per layer (e.g. FalconH1)
-        // - RotatingKVCache (sliding window models like Gemma3) can't be merged by
-        //   mergeCaches() — it discards pre-filled content, causing shape mismatches
+        // Skip system prompt pre-fill for CacheList models (e.g. FalconH1): BatchGenerator
+        // does not pass right-padding lengths to caches nested in a CacheList.
         let sampleCache = try context.model.newCache(parameters: nil)
-        let hasHybridCaches = sampleCache.contains { $0 is MambaCache || $0 is CacheList }
-        let hasRotatingCaches = sampleCache.contains { $0 is RotatingKVCache }
+        let hasCacheLists = sampleCache.contains { $0 is CacheList }
 
-        if let systemPrompt, !systemPrompt.isEmpty, !hasHybridCaches, !hasRotatingCaches {
+        if let systemPrompt, !systemPrompt.isEmpty, !hasCacheLists {
             do {
                 // A) Tokenize system-only message (no generation prompt suffix)
                 var systemOnlyContext: [String: any Sendable] = ["add_generation_prompt": false]
@@ -313,14 +304,10 @@ struct BatchGenerate: AsyncParsableCommand {
                         LMInput.Text(tokens: sysTensor), cache: singleCache, state: nil)
                     eval(singleCache.flatMap { $0.innerState() })
 
-                    // D) Clone N times via copy-on-write state assignment
-                    var clones: [[KVCache]] = []
-                    for _ in 0 ..< allTokens.count {
-                        var clonedCache = try context.model.newCache(parameters: nil)
-                        for layerIdx in 0 ..< singleCache.count {
-                            clonedCache[layerIdx].state = singleCache[layerIdx].state
-                        }
-                        clones.append(clonedCache)
+                    // D) Clone N times. copy() keeps each cache's metadata; assigning only
+                    // `state` leaves rotating (sliding-window) caches at offset 0.
+                    let clones: [[KVCache]] = (0 ..< allTokens.count).map { _ in
+                        singleCache.map { $0.copy() }
                     }
 
                     prefillCaches = clones
@@ -344,6 +331,7 @@ struct BatchGenerate: AsyncParsableCommand {
 
         // Create batch generator
         // Use smaller prefill step size for hybrid models (Mamba ssmAttn is O(L²) memory)
+        let hasHybridCaches = sampleCache.contains { $0 is MambaCache || $0 is CacheList }
         let batchPrefillStepSize = hasHybridCaches ? 64 : 512
         let generator = BatchGenerator(
             model: context.model,
