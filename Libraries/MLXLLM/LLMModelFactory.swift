@@ -116,6 +116,7 @@ public enum LLMTypeRegistry {
         "hunyuan_v1_dense": create(HunyuanConfiguration.self, HunyuanModel.init),
         "nemotron_labs_diffusion": create(
             NemotronLabsDiffusionConfiguration.self, NemotronLabsDiffusionModel.init),
+        "dory": create(DoryConfiguration.self, DoryModel.init),
     ])
 }
 
