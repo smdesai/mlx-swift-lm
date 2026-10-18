@@ -48,6 +48,7 @@ MODEL_TYPES=(
     nanochat
     granite_4_0
     qwen3_5
+    dory
 )
 
 MODEL_IDS=(
@@ -77,10 +78,11 @@ MODEL_IDS=(
     "dnakov/nanochat-d20-mlx"
     "mlx-community/granite-4.0-1b-4bit"
     "mlx-community/Qwen3.5-2B-4bit"
+    "smdesai/NVIDIA-Nemotron-Labs-Dory1.0-4B-MLX-4bit"
 )
 
 # Models that need --no-think
-NO_THINK_MODELS=" qwen3 qwen3_5 "
+NO_THINK_MODELS=" qwen3 qwen3_5 dory "
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
