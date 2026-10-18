@@ -208,15 +208,24 @@ public func ssmAttn(
 
         if var state {
             let expDtACumsum = MLX.exp(MLX.cumsum(dtA, axis: -2))
-            nextState = nextState + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * state
+            // Right-padded rows decay the previous state only up to their last real token.
+            var stateDecay = expDtACumsum[0..., -1, 0...]
+            if let lengths {
+                let pos = MLX.maximum(MLX.minimum(lengths, MLXArray(step)) - 1, MLXArray(0))
+                stateDecay =
+                    MLX.takeAlong(
+                        expDtACumsum, pos[0..., .newAxis, .newAxis], axis: 1)[0..., 0, 0...]
+            }
+            nextState = nextState + stateDecay[0..., 0..., .newAxis, .newAxis] * state
             state = state.reshaped(b, 1, g, repeats, dh, d)
             let C = C.reshaped(b, s, g, 1, d, 1)
             let yPrev = (state.matmul(C)).squeezed(axis: -1).flattened(start: 2, end: 3)
             y = y + expDtACumsum[.ellipsis, .newAxis] * yPrev
         }
         if let state, let lengths {
+            // A row with no real tokens in this chunk keeps its state.
             nextState = MLX.where(
-                expandedDimensions(lengths .< 0, axes: [1, 2, 3]), state, nextState)
+                expandedDimensions(lengths .<= 0, axes: [1, 2, 3]), state, nextState)
         }
 
         return (y.asType(x.dtype), nextState.asType(stateType))

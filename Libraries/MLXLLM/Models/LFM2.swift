@@ -204,13 +204,17 @@ class LFM2ShortConv: Module {
         _outProj.wrappedValue = Linear(args.hiddenSize, args.hiddenSize, bias: bias)
     }
 
-    public func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, mask: MLXArray? = nil, cache: MambaCache?) -> MLXArray
+    {
         let BCx = inProj(x)
         let BCxSplit = BCx.split(parts: 3, axis: -1)
         let B = BCxSplit[0]
         let C = BCxSplit[1]
         let x = BCxSplit[2]
         var Bx = B * x
+        if let mask {
+            Bx = MLX.where(mask[.ellipsis, .newAxis], Bx, 0)
+        }
 
         var state: MLXArray? = nil
         if let cache {
@@ -222,7 +226,15 @@ class LFM2ShortConv: Module {
 
         Bx = concatenated([state!, Bx], axis: -2)
         if let cache {
-            cache[0] = contiguous(Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...])
+            let keep = lCache - 1
+            if let lengths = cache.currentLengths {
+                // Right-padded rows keep the window that ends at their last real token.
+                let ends = clip(lengths, min: 0, max: x.dim(1))
+                let positions = ends[0..., .newAxis] + MLXArray(Int32(0) ..< Int32(keep))
+                cache[0] = takeAlong(Bx, positions[.ellipsis, .newAxis], axis: 1)
+            } else {
+                cache[0] = contiguous(Bx[0..., (Bx.dim(1) - keep)..., 0...])
+            }
             cache.advance(x.dim(1))
         }
 
@@ -294,13 +306,14 @@ class LFM2DecoderLayer: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, ssmMask: MLXArray? = nil,
+        cache: KVCache?
     ) -> MLXArray {
         let r: MLXArray
         if isAttentionLayer {
             r = attention!(operatorNorm(x), mask: mask, cache: cache)
         } else {
-            r = conv!(operatorNorm(x), cache: cache as? MambaCache)
+            r = conv!(operatorNorm(x), mask: ssmMask, cache: cache as? MambaCache)
         }
         let h = x + r
         let out = h + feedForward(ffnNorm(h))
@@ -348,9 +361,13 @@ public class LFM2ModelInner: Module {
                 let c = cache != nil && firstAttnIdx < cache!.count ? cache![firstAttnIdx] : nil
                 return createAttentionMask(h: h, cache: c)
             }()
+        // Masks padded positions in batched conv layers, as Python mlx-lm does.
+        let convIdx = (0 ..< layers.count).first { !args.fullAttnIdxs.contains($0) }
+        let convCache = convIdx.flatMap { i in cache.flatMap { i < $0.count ? $0[i] : nil } }
+        let ssmMask = createSSMMask(h: h, cache: convCache as? MambaCache)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: mask, cache: cache?[i])
+            h = layer(h, mask: mask, ssmMask: ssmMask, cache: cache?[i])
         }
 
         return embeddingNorm(h)

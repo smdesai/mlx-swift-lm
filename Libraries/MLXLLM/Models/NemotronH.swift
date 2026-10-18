@@ -178,9 +178,17 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let padded = concatenated([convState!, convInput], axis: 1)
 
         if let cache {
-            let end = padded.dim(1)
-            let start = max(0, end - (convKernelSize - 1))
-            cache[0] = contiguous(padded[0..., start ..< end, 0...])
+            let keep = convKernelSize - 1
+            if let lengths = cache.currentLengths, keep > 0 {
+                // Right-padded rows keep the window that ends at their last real token.
+                let ends = clip(lengths, min: 0, max: convInput.dim(1))
+                let positions = ends[0..., .newAxis] + MLXArray(Int32(0) ..< Int32(keep))
+                cache[0] = takeAlong(padded, positions[.ellipsis, .newAxis], axis: 1)
+            } else {
+                let end = padded.dim(1)
+                let start = max(0, end - keep)
+                cache[0] = contiguous(padded[0..., start ..< end, 0...])
+            }
         }
 
         let convOutput = conv1d(padded)
@@ -227,7 +235,8 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
             dtBias: dtBias,
             state: previousState,
             timeStepLimit: timeStepLimit,
-            mask: mask
+            mask: mask,
+            lengths: cache?.currentLengths
         )
 
         if let cache {

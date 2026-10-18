@@ -17,10 +17,6 @@ enum GraniteMoeHybridLayerType {
     case attention
 }
 
-private func createSSMMask(cache: KVCache?) -> MLXArray? {
-    nil
-}
-
 class GraniteMoeHybridRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
@@ -122,9 +118,17 @@ class GraniteMoeHybridMamba2Mixer: Module {
         let padded = concatenated([convState!, input], axis: 1)
 
         if let cache {
-            let end = padded.dim(1)
-            let start = max(0, end - (convKernelSize - 1))
-            cache[0] = contiguous(padded[0..., start ..< end, 0...])
+            let keep = convKernelSize - 1
+            if let lengths = cache.currentLengths, keep > 0 {
+                // Right-padded rows keep the window that ends at their last real token.
+                let ends = clip(lengths, min: 0, max: input.dim(1))
+                let positions = ends[0..., .newAxis] + MLXArray(Int32(0) ..< Int32(keep))
+                cache[0] = takeAlong(padded, positions[.ellipsis, .newAxis], axis: 1)
+            } else {
+                let end = padded.dim(1)
+                let start = max(0, end - keep)
+                cache[0] = contiguous(padded[0..., start ..< end, 0...])
+            }
         }
 
         let convOutput = conv1d(padded)
@@ -176,7 +180,8 @@ class GraniteMoeHybridMamba2Mixer: Module {
             dtBias: dtBias,
             state: previousState,
             timeStepLimit: timeStepLimit,
-            mask: mask
+            mask: mask,
+            lengths: cache?.currentLengths
         )
 
         if let cache {
@@ -480,9 +485,10 @@ public class GraniteMoeHybridModelInner: Module {
         }()
 
         let ssmMask = createSSMMask(
+            h: hidden,
             cache: firstMambaIndex.flatMap { index in
-                cache?[index]
-            })
+                cache.flatMap { index < $0.count ? $0[index] : nil }
+            } as? MambaCache)
 
         for (i, layer) in layers.enumerated() {
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache?[i])
