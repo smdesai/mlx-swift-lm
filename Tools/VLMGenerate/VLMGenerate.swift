@@ -114,6 +114,9 @@ struct VLMGenerate: AsyncParsableCommand {
             switch generation {
             case .chunk(let text):
                 print(text, terminator: "")
+            case .reasoning(let text):
+                // Thinking text, which arrived inside .chunk before reasoning events.
+                print(text, terminator: "")
             case .info(let info):
                 print("")  // newline after generated text
                 printErr("")
@@ -127,7 +130,7 @@ struct VLMGenerate: AsyncParsableCommand {
                 printErr(
                     "Peak memory: \(String(format: "%.2f", Double(Memory.peakMemory) / 1e9)) GB"
                 )
-            case .toolCall, .rejectedToolCall:
+            case .toolCall, .rejectedToolCall, .steering:
                 break
             }
         }
