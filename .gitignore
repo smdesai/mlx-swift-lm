@@ -102,3 +102,8 @@ pyproject.toml
 uv.lock
 main.py
 
+# Local build outputs and run logs (repo root and Tools/)
+default.metallib
+default.metallib.pre
+test-results/
+*.log
