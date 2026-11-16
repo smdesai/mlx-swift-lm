@@ -72,6 +72,7 @@ The following models have been tried:
 - mlx-community/gemma-3-27b-it-qat-4bit
 - HuggingFaceTB/SmolVLM2-500M-Video-Instruct-mlx
 - mlx-community/Muse-Glimmer-30B-4bit
+- LiquidAI/LFM3-Omni-2B
 
 Currently supported model types are:
 
@@ -83,6 +84,7 @@ Currently supported model types are:
 - gemma3
 - smolvlm
 - muse_glimmer
+- lfm3_omni
 
 See [llm-tool](../../Tools/llm-tool)
 

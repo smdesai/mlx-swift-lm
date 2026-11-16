@@ -142,6 +142,7 @@ VLMRegistry.paligemma3bMix448_8bit // mlx-community/paligemma-3b-mix-448-8bit
 | `mistral3` | Mistral 3 VLM |
 | `lfm2_vl`, `lfm2-vl` | LFM2 VL |
 | `muse_glimmer` | Meta Muse Glimmer (text, image, reasoning, and ATEM tool calls) |
+| `lfm3_omni` | LFM3-Omni (image, video, speech and text in; text out, or speech with `LFM3Omni.generateSpeech` and `LFM3Codec`) |
 
 ## Loading Any Model
 

@@ -108,6 +108,7 @@ public enum VLMTypeRegistry {
         "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "lfm3_omni": create(LFM3OmniConfiguration.self, LFM3Omni.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
     ])
@@ -151,6 +152,8 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        "Lfm3OmniProcessor": create(
+            LFM3OmniProcessorConfiguration.self, LFM3OmniProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "MuseGlimmerProcessor": create(
@@ -436,6 +439,7 @@ public final class VLMModelFactory: GenericModelFactory {
         if let genEosIds = generationConfig?.eosTokenIds?.values {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
+        eosTokenIds.formUnion(additionalStopTokenIds(of: model))
 
         // Honor `suppress_tokens` from generation_config.json (transformers'
         // SuppressTokensLogitsProcessor): merge into the model's suppressed
@@ -535,6 +539,10 @@ public final class VLMModelFactory: GenericModelFactory {
             tokenizer: tokenizer)
     }
 
+}
+
+private func additionalStopTokenIds(of model: LanguageModel) -> Set<Int> {
+    (model as? AdditionalStopTokensProviding)?.additionalStopTokenIds ?? []
 }
 
 /// Error wrapper that includes the filename for better error messages.
