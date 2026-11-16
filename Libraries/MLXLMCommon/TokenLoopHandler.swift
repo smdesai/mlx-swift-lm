@@ -1,5 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
+import MLX
+
 /// Controls whether the generation loop continues.
 public enum TokenLoopDisposition: Sendable {
     /// Continue generating tokens.
@@ -31,6 +33,10 @@ public protocol TokenLoopHandler: SendableMetatype {
     /// are not included in the public output or generation token count.
     var receivesStopTokens: Bool { get }
 
+    /// Whether decoding can end here to apply pending steering input.
+    /// The default, `false`, lets the current model step finish.
+    var canEndForSteering: Bool { get }
+
     /// Return `.stop` for semantic generation stops, or `.cancelled` for consumer termination.
     ///
     /// `logProbabilities` stays on the GPU until you call
@@ -58,6 +64,7 @@ public protocol TokenLoopHandler: SendableMetatype {
 }
 
 extension TokenLoopHandler {
+    public var canEndForSteering: Bool { false }
     public var additionalStopTokenIDs: Set<Int> { [] }
     public var receivesStopTokens: Bool { false }
 }
@@ -66,18 +73,26 @@ extension TokenLoopHandler {
 public struct TextToolTokenLoopHandler: TokenLoopHandler {
     public typealias Output = Generation
 
-    private static let logger = Logger(
-        subsystem: "mlx-swift-lm", category: "TokenStreamProtocol")
+    private static let logger = MLXLogger(label: "TokenStreamProtocol")
     private var decoder: any TokenStreamDecoder
+    var cachedPromptTokenCount = 0
+    var speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason?
+    private var hasResponse = false
+    private var hasNonTextOutput = false
+
+    public var canEndForSteering: Bool {
+        hasResponse && !hasNonTextOutput && decoder.canEndForSteering
+    }
 
     public init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
         tools: [[String: any Sendable]]? = nil,
-        toolCallPolicy: ToolCallPolicy = .init()
+        toolCallPolicy: ToolCallPolicy = .init(),
+        reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil
     ) {
         self.decoder = format.makeTokenStreamDecoder(
             tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
-            toolCallPolicy: toolCallPolicy)
+            toolCallPolicy: toolCallPolicy, reasoning: reasoning)
     }
 
     public var additionalStopTokenIDs: Set<Int> { decoder.additionalStopTokenIDs }
@@ -117,7 +132,10 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
         .info(
             info.withToolCallCounts(
                 rejected: decoder.rejectedToolCallCount,
-                recovered: decoder.recoveredToolCallCount))
+                recovered: decoder.recoveredToolCallCount)
+        ).attributingSessionMetadata(
+            cachedPromptTokenCount: cachedPromptTokenCount,
+            speculativeDecodingFallbackReason: speculativeDecodingFallbackReason)
     }
 
     private mutating func process(
@@ -143,29 +161,33 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
         emit: (sending Generation) -> Bool
     ) -> TokenLoopDisposition {
         switch event {
-        case .reasoning:
-            // The public Generation stream intentionally exposes only response
-            // text and tool calls. Protocol-aware clients consume reasoning via
-            // the package-level TokenStreamDecoder contract.
+        case .reasoning(let reasoning):
+            if !emit(.reasoning(reasoning)) {
+                return .cancelled
+            }
             return .more
 
         case .response(let response):
+            hasResponse = hasResponse || !response.isEmpty
             if !emit(.chunk(response)) {
                 return .cancelled
             }
             return .more
 
         case .toolCall(let toolCall):
+            hasNonTextOutput = true
             if !emit(.toolCall(toolCall)) {
                 return .cancelled
             }
             return .more
 
         case .protocolError(let message):
+            hasNonTextOutput = true
             Self.logger.error("\(message)")
             return .more
 
         case .rejectedToolCall(let rejection):
+            hasNonTextOutput = true
             if !emit(.rejectedToolCall(rejection)) {
                 return .cancelled
             }

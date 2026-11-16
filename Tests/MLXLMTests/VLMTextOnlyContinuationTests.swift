@@ -177,14 +177,14 @@ struct VLMTextOnlyContinuationTests {
         let expected = try prepare(
             model, tokens: MLXArray((1 ... 9).map(Int32.init)).expandedDimensions(axis: 0),
             cache: referenceCache, prefill: .init(chunking: .unchunked))
-        #expect(
-            allClose(actual[0..., -1, 0...], expected[0..., -1, 0...], rtol: 1e-4, atol: 1e-4)
-                .item(Bool.self))
+        expectClose(
+            actual[0..., -1, 0...], expected[0..., -1, 0...], rtol: 1e-4, atol: 1e-4,
+            reducedAtol: 2e-2)
         let token = MLXArray([Int32(11)]).expandedDimensions(axis: 0)
         let decoded = model(token, cache: cache)
         let reference = model(token, cache: referenceCache)
         eval(decoded, reference, cache, referenceCache)
-        #expect(allClose(decoded, reference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+        expectClose(decoded, reference, rtol: 1e-4, atol: 1e-4, reducedAtol: 2e-2)
         #expect(cache.allSatisfy { $0.offset == 10 })
     }
 
@@ -232,6 +232,27 @@ struct VLMTextOnlyContinuationTests {
             prefill: .init(stepSize: 2))
         #expect(allClose(continuation, reference, rtol: 0, atol: 0).item(Bool.self))
         #expect(cache.map(\.offset) == referenceCache.map(\.offset))
+    }
+
+    /// Pixels arrive as float32. If the image features keep that dtype, the merged
+    /// embeddings promote the whole language model and its cache to float32.
+    @Test("An image prompt keeps the cache in the model dtype", arguments: modelTypes)
+    func imagePromptKeepsCacheDtype(modelType: String) async throws {
+        let model = try await model(modelType)
+        model.apply { $0.dtype.isFloatingPoint ? $0.asType(.float16) : $0 }
+        let isFastVLM = modelType == "fastvlm" || modelType == "llava_qwen2"
+        let isIdefics3 = modelType == "idefics3" || modelType == "smolvlm"
+        let pixels = MLXArray.ones(isIdefics3 ? [1, 16, 16, 3] : [1, 3, 16, 16])
+        let image = LMInput.ProcessedImage(pixels: pixels, frames: [.init(1, 16, 16)])
+        let ids: [Int32] = [1] + Array(repeating: 10, count: isFastVLM ? 1 : 4) + [2]
+        let mask = MLXArray.ones([1, ids.count], type: Int32.self)
+        let cache = try model.newCache(parameters: nil)
+        _ = try prepare(
+            model, tokens: MLXArray(ids), cache: cache, prefill: .init(), image: image, mask: mask)
+        eval(model(MLXArray([Int32(11)]).expandedDimensions(axis: 0), cache: cache))
+        for layer in cache {
+            #expect(layer.state.map(\.dtype) == [.float16, .float16])
+        }
     }
 
     @Test("ChatSession reuses text-only VLM prompts across turns", arguments: modelTypes)

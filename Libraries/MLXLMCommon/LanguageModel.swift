@@ -303,6 +303,11 @@ public struct LMOutput {
             }
         }
 
+        /// Whether this state currently carries any model-owned values.
+        /// Package code uses this to avoid persisting a non-nil shell after
+        /// transient iterator exchange keys have been removed.
+        package var isEmpty: Bool { contents.isEmpty }
+
         enum SerializationError: LocalizedError {
             case unsupportedValue(key: String, type: String)
 
@@ -364,8 +369,8 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     ///
     /// Implementations that chunk the prompt should drive the loop with
     /// ``PrefillParameters/forEachChunk(total:reserving:defaultStepSize:maximumStepSize:_:)``,
-    /// which owns cancellation, pooling, and per-chunk progress. An
-    /// implementation returning `.logits` owns its whole
+    /// which owns cancellation, pooling, buffer cache clearing, and per-chunk
+    /// progress. An implementation returning `.logits` owns its whole
     /// ``PrefillParameters/progress`` sequence, including the terminal
     /// `(total, total)`; one returning `.tokens` reports only its own chunks —
     /// the iterator that evaluates the remainder completes the sequence.
