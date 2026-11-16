@@ -42,8 +42,9 @@ cmake -S "$MLX_SRC" -B "$BUILD" \
 
 BUILD_MAKE="$BUILD/mlx/backend/metal/kernels/CMakeFiles/mlx-metallib.dir/build.make"
 
-# 2. Compile every kernel. Regular kernels get -std=metal3.2; the *_nax kernels need
-#    Metal 4 tensor ops, so they get -std=metal4.0.
+# 2. Compile every kernel. Regular kernels get -std=metal3.2; the NAX kernels (any name
+#    with "_nax", e.g. quantized_nax or gated_delta_update_nax_vjp) need Metal 4 tensor
+#    ops, so they get -std=metal4.0.
 python3 - "$BUILD_MAKE" "$AIR" <<'EOF'
 import re, subprocess, sys, concurrent.futures as cf
 
@@ -55,7 +56,7 @@ for line in open(build_make):
     line = re.sub(r"^\s*cd [^&]*&& ", "", line.strip())
     name = re.search(r"-o (\w+)\.air", line).group(1)
     line = line.replace(f"-o {name}.air", f"-o {air_dir}/{name}.air")
-    std = "-std=metal4.0" if name.endswith("_nax") else "-std=metal3.2"
+    std = "-std=metal4.0" if "_nax" in name else "-std=metal3.2"
     cmds.append((name, line.replace("-x metal", f"-x metal {std}", 1)))
 
 def run(item):
