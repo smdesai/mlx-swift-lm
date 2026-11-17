@@ -69,6 +69,10 @@ let package = Package(
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
+        // MLXHuggingFace's ChatTemplateTools passes tool definitions to chat templates as Jinja
+        // values, in their written order. The range is swift-transformers' own (2.4.2 ..< 4.0.0)
+        // from the first version checked.
+        .package(url: "https://github.com/huggingface/swift-jinja.git", "2.5.1" ..< "4.0.0"),
     ],
     targets: [
         .target(
@@ -198,12 +202,21 @@ let package = Package(
             dependencies: [
                 "MLXHuggingFaceMacros",
                 "MLXLMCommon",
+                .product(name: "Jinja", package: "swift-jinja"),
                 .target(
                     name: "MLXFoundationModels",
                     condition: .when(traits: ["FoundationModelsIntegration"])
                 ),
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        .testTarget(
+            name: "MLXHuggingFaceTests",
+            dependencies: [
+                "MLXHuggingFace",
+                .product(name: "Jinja", package: "swift-jinja"),
+            ],
+            path: "Tests/MLXHuggingFaceTests"
         ),
         .testTarget(
             name: "MLXHuggingFaceMacrosTests",

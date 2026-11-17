@@ -115,8 +115,11 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         additionalContext: [String: any Sendable]?
                     ) throws -> [Int] {
                         do {
+                            // Tools in their written order: swift-jinja sorts a dictionary's keys.
                             return try upstream.applyChatTemplate(
-                                messages: messages, tools: tools, additionalContext: additionalContext)
+                                messages: messages,
+                                tools: try MLXHuggingFace.ChatTemplateTools.ordered(tools),
+                                additionalContext: additionalContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
                             throw MLXLMCommon.TokenizerError.missingChatTemplate
                         }
