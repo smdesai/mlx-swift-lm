@@ -73,6 +73,10 @@ let package = Package(
         // values, in their written order. The range is swift-transformers' own (2.4.2 ..< 4.0.0)
         // from the first version checked.
         .package(url: "https://github.com/huggingface/swift-jinja.git", "2.5.1" ..< "4.0.0"),
+        // ChatTemplateTools builds OrderedDictionary values itself: a direct dependency, so that a
+        // dynamic MLXHuggingFace product (Xcode makes one when an app and its test bundle both link
+        // it) links OrderedCollections instead of relying on Jinja's re-export.
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -203,6 +207,7 @@ let package = Package(
                 "MLXHuggingFaceMacros",
                 "MLXLMCommon",
                 .product(name: "Jinja", package: "swift-jinja"),
+                .product(name: "OrderedCollections", package: "swift-collections"),
                 .target(
                     name: "MLXFoundationModels",
                     condition: .when(traits: ["FoundationModelsIntegration"])
@@ -215,6 +220,7 @@ let package = Package(
             dependencies: [
                 "MLXHuggingFace",
                 .product(name: "Jinja", package: "swift-jinja"),
+                .product(name: "OrderedCollections", package: "swift-collections"),
             ],
             path: "Tests/MLXHuggingFaceTests"
         ),

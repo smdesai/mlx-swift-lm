@@ -2,6 +2,7 @@
 
 import Foundation
 import Jinja
+import OrderedCollections
 
 /// Tool definitions for a chat template, in the order they were written rather than alphabetical.
 ///
