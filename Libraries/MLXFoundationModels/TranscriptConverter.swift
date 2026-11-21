@@ -268,6 +268,22 @@ struct TranscriptConverter {
         return ordered
     }
 
+    /// Whether a tool result follows the latest prompt: the model has called a tool since it was
+    /// last prompted, and this request continues from that result.
+    static func toolOutputFollowsLatestPrompt(in entries: some Collection<Transcript.Entry>)
+        -> Bool
+    {
+        var follows = false
+        for entry in entries {
+            switch entry {
+            case .toolOutput: follows = true
+            case .prompt: follows = false
+            default: break
+            }
+        }
+        return follows
+    }
+
 }
 
 #endif  // canImport(FoundationModels)

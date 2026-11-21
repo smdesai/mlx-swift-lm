@@ -272,6 +272,123 @@ enum SchemaConverter {
         return jsonString
     }
 
+    /// The required-mode tool-call grammar for models whose chat template writes calls in the XML
+    /// function format (`ToolCallFormat.xmlFunction` and `.qwen35`: LFM3, LFM3-Omni, Qwen3 Coder):
+    ///
+    /// ```
+    /// <tool_call>
+    /// <function=NAME>
+    /// <parameter=KEY>
+    /// VALUE
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    ///
+    /// Such a model never writes the JSON envelope `encodeToolCallingGrammar` builds. Forced into
+    /// it, LFM3-Omni changed its choice of tool: on a "how many days until" question its own format
+    /// puts `search_context` ahead of `days_until` (logits 15.8 / 12.7, as the publisher's PyTorch
+    /// model computes), the envelope puts `days_until` ahead (15.5 / 15.0), and the call then
+    /// carries an invented date.
+    ///
+    /// With `allowsText`, the model may also reply in text instead (xgrammar's `triggered_tags`:
+    /// free text, and each `<tool_call>` the start of one tool's call, at most one). Once such a
+    /// model has what it needs it answers in text rather than calling a tool; holding it to a call
+    /// then made it search again and again where it meant to answer (LFM3-Omni: 5 calls instead
+    /// of 2 for "who owns Project Falcon?"; questions the notes can't answer ran out of budget).
+    /// The caller sees that text as the reply and can ask again for the call, as an agent loop
+    /// does. This is the grammar the Core AI port of LFM3-Omni uses.
+    ///
+    /// Without `allowsText`, the output is exactly one call, with no text (`at_least_one` with
+    /// `stop_after_first`). That's for the first request after a prompt, before the model has
+    /// any tool result: allowed text there, LFM3 1.7B answered "I don't have any information
+    /// about …" without searching.
+    ///
+    /// One tag per tool: `begin` commits the tool's name in the model's own syntax, `content` is
+    /// its parameter schema as xgrammar's `qwen_xml_parameter` (one `<parameter=KEY>` block per
+    /// property, in the schema's declared order), `end` closes the call. Lists are bounded where
+    /// the schema sets no bound (`maxItems` 16, `maxLength` 120 on strings in a list): a model
+    /// that means to write something else inside a list can otherwise repeat items until its
+    /// token limit.
+    ///
+    /// Requires a non-empty tool list.
+    static func encodeXMLFunctionToolCallingGrammar(
+        tools: [Transcript.ToolDefinition],
+        allowsText: Bool
+    ) throws -> String {
+        guard !tools.isEmpty else {
+            throw SchemaConversionError.noTools
+        }
+
+        let encoder = JSONEncoder()
+        let toolTags: [[String: Any]] = try tools.map { tool in
+            let paramsData = try encoder.encode(tool.parameters)
+            let paramsAny = try JSONSerialization.jsonObject(with: paramsData)
+            return [
+                "type": "tag",
+                "begin": "<tool_call>\n<function=\(tool.name)>\n",
+                // The vendored xgrammar's name for the `qwen_xml` json_schema style.
+                "content": [
+                    "type": "qwen_xml_parameter",
+                    "json_schema": boundingLists(paramsAny),
+                ],
+                "end": "\n</function>\n</tool_call>",
+            ]
+        }
+        let structuralTag: [String: Any] = [
+            "type": "structural_tag",
+            "format": [
+                "type": "triggered_tags",
+                "triggers": ["<tool_call>"],
+                "tags": toolTags,
+                "at_least_one": !allowsText,
+                "stop_after_first": true,
+            ] as [String: Any],
+        ]
+
+        let jsonString = try orderedJSONString(structuralTag)
+        logger.debug(
+            "XML-function tool-calling structural-tag JSON (\(jsonString.utf8.count) bytes, "
+                + "\(tools.count) tools, text \(allowsText ? "allowed" : "not allowed"))"
+        )
+        return jsonString
+    }
+
+    /// The longest list, and the longest string in a list, `encodeXMLFunctionToolCallingGrammar`
+    /// allows where a schema sets no bound.
+    static let toolCallListItemLimit = 16
+    static let toolCallListStringLengthLimit = 120
+
+    /// `schema` with `maxItems` on its lists and `maxLength` on the strings in them, where it sets
+    /// none; nested properties, items and `$defs` included.
+    static func boundingLists(_ schema: Any, inList: Bool = false) -> Any {
+        guard var object = schema as? [String: Any] else { return schema }
+        for (key, value) in object {
+            switch key {
+            case "items":
+                object[key] = boundingLists(value, inList: true)
+            case "properties", "$defs":
+                if let members = value as? [String: Any] {
+                    object[key] = members.mapValues { boundingLists($0, inList: inList) }
+                }
+            case "anyOf", "oneOf", "allOf":
+                if let alternatives = value as? [Any] {
+                    object[key] = alternatives.map { boundingLists($0, inList: inList) }
+                }
+            default:
+                break
+            }
+        }
+        let type = object["type"] as? String
+        if type == "array", object["maxItems"] == nil {
+            object["maxItems"] = toolCallListItemLimit
+        }
+        if type == "string", inList, object["maxLength"] == nil {
+            object["maxLength"] = toolCallListStringLengthLimit
+        }
+        return object
+    }
+
     private static func toolCallingEnvelopeObject(
         tools: [Transcript.ToolDefinition]
     ) throws -> [String: Any] {

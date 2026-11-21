@@ -89,6 +89,15 @@ private struct BookTripArgs {
 ///   tool-call object. Shape-only assertions here; real-tokenizer compilation
 ///   is exercised by the integration suite (the byte-tokenizer used in these
 ///   unit tests doesn't define Qwen's `<tool_call>` special tokens).
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, *)
+@Generable
+private struct CiteArgs {
+    @Guide(description: "The answer.")
+    var answer: String
+    @Guide(description: "Source ids.")
+    var sources: [String]
+}
+
 @Suite
 struct ToolCallingSchemaTests {
 
@@ -456,6 +465,119 @@ struct ToolCallingSchemaTests {
         let expectedData = try JSONEncoder().encode(tool.parameters)
         let expectedSchema = try JSONSerialization.jsonObject(with: expectedData)
         #expect(try canonicalJSON(actualSchema) == canonicalJSON(expectedSchema))
+    }
+
+    // MARK: - XML Function Grammar
+
+    @Test
+    func xmlFunctionGrammarRejectsEmptyToolList() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        #expect(throws: SchemaConverter.SchemaConversionError.noTools) {
+            _ = try SchemaConverter.encodeXMLFunctionToolCallingGrammar(tools: [], allowsText: true)
+        }
+    }
+
+    /// One tag per tool in the model's own call syntax, its parameters as `<parameter=…>` blocks
+    /// in the declared order (`origin` before `destination`, not alphabetical); at most one call,
+    /// and text allowed instead only with `allowsText`.
+    @Test(arguments: [true, false])
+    func xmlFunctionGrammarUsesTheModelsCallSyntax(allowsText: Bool) throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let weather = Transcript.ToolDefinition(
+            name: "get_weather", description: "Get weather",
+            parameters: WeatherArgs.generationSchema)
+        let bookTrip = Transcript.ToolDefinition(
+            name: "book_trip", description: "Books a trip",
+            parameters: BookTripArgs.generationSchema)
+
+        let grammar = try SchemaConverter.encodeXMLFunctionToolCallingGrammar(
+            tools: [weather, bookTrip], allowsText: allowsText)
+        let parsed = try parseAsDictionary(grammar)
+        #expect(parsed["type"] as? String == "structural_tag")
+        let format = try #require(parsed["format"] as? [String: Any])
+        #expect(format["type"] as? String == "triggered_tags")
+        #expect(format["triggers"] as? [String] == ["<tool_call>"])
+        #expect(format["at_least_one"] as? Bool == !allowsText)
+        #expect(format["stop_after_first"] as? Bool == true)
+        let tags = try #require(format["tags"] as? [[String: Any]])
+        #expect(
+            tags.map { $0["begin"] as? String }
+                == ["<tool_call>\n<function=get_weather>\n", "<tool_call>\n<function=book_trip>\n"])
+        for tag in tags {
+            #expect(tag["type"] as? String == "tag")
+            #expect(tag["end"] as? String == "\n</function>\n</tool_call>")
+            let content = try #require(tag["content"] as? [String: Any])
+            #expect(content["type"] as? String == "qwen_xml_parameter")
+            #expect(content["json_schema"] is [String: Any])
+        }
+        let origin = try #require(grammar.range(of: "\"origin\":")).lowerBound
+        let destination = try #require(grammar.range(of: "\"destination\":")).lowerBound
+        #expect(origin < destination, "parameters keep their declared order")
+    }
+
+    @Test
+    func xmlFunctionGrammarBoundsLists() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let cite = Transcript.ToolDefinition(
+            name: "cite", description: "Cite sources", parameters: CiteArgs.generationSchema)
+        let parsed = try parseAsDictionary(
+            try SchemaConverter.encodeXMLFunctionToolCallingGrammar(tools: [cite], allowsText: true)
+        )
+        let format = try #require(parsed["format"] as? [String: Any])
+        let tag = try #require((format["tags"] as? [[String: Any]])?.first)
+        let schema = try #require(
+            (tag["content"] as? [String: Any])?["json_schema"] as? [String: Any])
+        let properties = try #require(schema["properties"] as? [String: Any])
+        let sources = try #require(properties["sources"] as? [String: Any])
+        #expect(sources["maxItems"] as? Int == SchemaConverter.toolCallListItemLimit)
+        let items = try #require(sources["items"] as? [String: Any])
+        #expect(items["maxLength"] as? Int == SchemaConverter.toolCallListStringLengthLimit)
+        let answer = try #require(properties["answer"] as? [String: Any])
+        #expect(answer["maxLength"] == nil, "only strings inside a list are bounded")
+    }
+
+    @Test(arguments: [true, false])
+    func xmlFunctionGrammarCompilesWithXGrammar(allowsText: Bool) throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let weather = Transcript.ToolDefinition(
+            name: "get_weather", description: "Get weather",
+            parameters: WeatherArgs.generationSchema)
+        let cite = Transcript.ToolDefinition(
+            name: "cite", description: "Cite sources", parameters: CiteArgs.generationSchema)
+        let grammar = try SchemaConverter.encodeXMLFunctionToolCallingGrammar(
+            tools: [weather, cite], allowsText: allowsText)
+        _ = try GrammarConstraint(
+            tokenizer: try makeByteTokenizer(), structuralTag: grammar, fastForward: false)
+    }
+
+    /// What xgrammar accepts, not just the JSON's shape: with `allowsText` the output may open
+    /// with text or end before any call; without it, it must open with the call and can't end
+    /// before one.
+    @Test(arguments: [true, false])
+    func xmlFunctionGrammarAllowsTextOnlyWhenAsked(allowsText: Bool) throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let weather = Transcript.ToolDefinition(
+            name: "get_weather", description: "Get weather",
+            parameters: WeatherArgs.generationSchema)
+        let grammar = try SchemaConverter.encodeXMLFunctionToolCallingGrammar(
+            tools: [weather], allowsText: allowsText)
+        let tokenizer = try makeByteTokenizer()
+        func constraint() throws -> GrammarConstraint {
+            try GrammarConstraint(tokenizer: tokenizer, structuralTag: grammar, fastForward: false)
+        }
+
+        let text = try constraint()
+        let acceptsText = (try? text.commitToken(Int32(UInt8(ascii: "I")))) != nil
+        #expect(acceptsText == allowsText)
+
+        let call = try constraint()
+        for byte in "<tool_call>\n<function=get_weather>\n".utf8 {
+            _ = try call.commitToken(Int32(byte))
+        }
+
+        let empty = try constraint()
+        let endsAtOnce = (try? empty.commitToken(Int32(tokenizer.vocabSize - 1))) != nil
+        #expect(endsAtOnce == allowsText, "end of sequence before any call")
     }
 
     private func canonicalJSON(_ object: Any) throws -> Data {

@@ -10,9 +10,16 @@ import Testing
 
 /// Byte-level tokenizer: token id = byte value, 255 = EOS.
 private struct ByteTokenizer: MLXLMCommon.Tokenizer {
+    /// Decodes EOS as `<eos>`, as a chat model's tokenizer decodes `<|im_end|>`.
+    var decodesEOS = false
+
     func encode(text: String, addSpecialTokens: Bool) -> [Int] { text.utf8.map(Int.init) }
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        String(bytes: tokenIds.filter { $0 != 255 }.map(UInt8.init), encoding: .utf8) ?? ""
+        guard decodesEOS else {
+            return String(bytes: tokenIds.filter { $0 != 255 }.map(UInt8.init), encoding: .utf8)
+                ?? ""
+        }
+        return tokenIds.map { $0 == 255 ? "<eos>" : String(UnicodeScalar(UInt8($0))) }.joined()
     }
     func convertTokenToId(_ token: String) -> Int? {
         if token == "<eos>" { return 255 }
@@ -97,6 +104,47 @@ struct GuidedForwardStateTests {
             #expect(sink.grammarTerminated)
             #expect(sink.fastForwardTokenIDs.isEmpty != fastForward)
             #expect(model.forwarded == prompt.map(Int.init) + output.utf8.map(Int.init))
+        }
+    }
+
+    /// Where the grammar allows free text (before a `triggered_tags` trigger) its mask excludes
+    /// nothing, so the loop's own end-of-sequence check doesn't run, and the grammar accepts the
+    /// stop token as the end. The stop token ends the output; it isn't part of it.
+    @Test
+    func aStopTokenInFreeTextIsNotEmitted() throws {
+        try Stream.withNewDefaultStream(device: .cpu) {
+            let tokenizer = ByteTokenizer(decodesEOS: true)
+            let vocabulary = (0 ..< 256).map { String(format: "<0x%02X>", $0) }
+            let grammarTokenizer = try GrammarTokenizer(
+                vocab: vocabulary, vocabType: .byteFallback, eosTokenId: 255)
+            let structuralTag = """
+                {"type": "structural_tag", "format": {"type": "triggered_tags",
+                "triggers": ["<call>"], "tags": [{"type": "tag", "begin": "<call>",
+                "content": {"type": "const_string", "value": "x"}, "end": "</call>"}],
+                "at_least_one": false, "stop_after_first": true}}
+                """
+            let constraint = try GrammarConstraint(
+                tokenizer: grammarTokenizer, structuralTag: structuralTag,
+                hostTokenizer: tokenizer)
+            let model = RecordingModel()
+            let context = ModelContext(
+                configuration: ModelConfiguration(id: "recording"), model: model,
+                processor: UnusedProcessor(), tokenizer: tokenizer)
+            let sink = GuidedGenerationDiagnosticSink()
+            var output = ""
+            let generated = try GuidedGenerationDiagnosticSink.$current.withValue(sink) {
+                try GuidedGenerationLoop.run(
+                    input: LMInput(tokens: MLXArray([1, 2, 3] as [Int32])), context: context,
+                    constraint: constraint, maxTokens: 64, vocabSize: 256
+                ) {
+                    output += $0
+                    return true
+                }
+            }
+
+            #expect(output == "")
+            #expect(generated == 0)
+            #expect(!sink.sampledTokenIDs.contains(255))
         }
     }
 }

@@ -314,6 +314,20 @@ public enum GuidedGenerationLoop {
             // Commit to grammar
             let commitResult = try constraint.commitToken(Int32(token))
 
+            // Where the grammar excludes no token (free text, as before a
+            // `triggered_tags` trigger), the EOS check above is skipped and a
+            // stop token reaches the grammar, which accepts it as the end. It
+            // ends the output; it isn't part of it.
+            if commitResult.isTerminated && stopTokenIDs.contains(tokenId) {
+                if diagnosticLog {
+                    logger.info(
+                        "[GuidedGen] Stop reason: EOS accepted by grammar at token \(tokenCount)"
+                    )
+                }
+                grammarStopped = true
+                break
+            }
+
             diagnosticSink?.recordSampledToken(tokenId)
             // Yield the sampled token
             detokenizer.append(token: tokenId)

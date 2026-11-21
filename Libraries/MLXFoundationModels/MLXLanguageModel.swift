@@ -289,6 +289,24 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// Prompt prefill step size; `nil` uses the default step size.
     public let prefillStepSize: Int?
 
+    /// The syntax a `.required` tool call is constrained to.
+    public enum RequiredToolCallGrammar: Sendable, Equatable {
+        /// `<tool_call>` around `{"name": …, "arguments": …}`, or that JSON bare, whatever the
+        /// model's own call format.
+        case jsonEnvelope
+        /// The model's own call format where it writes XML function calls
+        /// (`ToolCallFormat.xmlFunction` and `.qwen35`: LFM3, LFM3-Omni, Qwen3 Coder), with a text
+        /// reply allowed once a tool result has come back (see
+        /// `SchemaConverter.encodeXMLFunctionToolCallingGrammar`); the JSON envelope for any
+        /// other format.
+        case modelFormat
+    }
+
+    /// The syntax a `.required` tool call is constrained to. Which one suits a model is
+    /// measured, not derived: on the same agent evals, LFM3-Omni 2B answered more questions
+    /// right in its own format, and LFM3 1.7B in the JSON envelope.
+    public let requiredToolCallGrammar: RequiredToolCallGrammar
+
     /// Configuration the framework uses to create and cache executors.
     public var executorConfiguration: Executor.Configuration {
         Executor.Configuration(modelID: modelID)
@@ -334,6 +352,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
         self.prefillStepSize = prefillStepSize
+        self.requiredToolCallGrammar = .jsonEnvelope
         self.weightsLocation = weightsLocation
         self.load = { configuration, progress in
             try await load(configuration, progress.download ?? { _ in })
@@ -347,12 +366,17 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// Use this initializer when the loader forwards `LoadProgressHandlers` to
     /// `loadModelContainer`. The deprecated `load:` initializer remains available
     /// for source compatibility with download-only loaders.
+    ///
+    /// `requiredToolCallGrammar` is the syntax a `.required` tool call is
+    /// constrained to (``RequiredToolCallGrammar``); the default, the JSON
+    /// envelope, is the syntax every model got before the option existed.
     public init(
         configuration: ModelConfiguration,
         capabilities: [LanguageModelCapabilities.Capability] = [.guidedGeneration],
         configurationResolver: any ModelConfigurationResolver =
             DefaultConfigurationResolver(),
         prefillStepSize: Int? = nil,
+        requiredToolCallGrammar: RequiredToolCallGrammar = .jsonEnvelope,
         weightsLocation: @Sendable @escaping (String) -> URL,
         progress: LoadProgressHandlers = .init(),
         load: @escaping ProgressContainerLoader
@@ -361,6 +385,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
         self.prefillStepSize = prefillStepSize
+        self.requiredToolCallGrammar = requiredToolCallGrammar
         self.weightsLocation = weightsLocation
         self.load = load
         self.progress = progress
@@ -775,6 +800,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             let declaresReasoning = model.capabilities.contains(.reasoning)
             let configurationResolver = model.configurationResolver
             let prefillStepSize = model.prefillStepSize
+            let requiredToolCallGrammar = model.requiredToolCallGrammar
             let labeledAttachments = TranscriptConverter.labeledAttachments(in: request.transcript)
 
             do {
@@ -1074,8 +1100,23 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 tools: toolSpecs,
                                 additionalContext: toolAwareContext))
 
+                        // With `.modelFormat`, a model whose template writes XML
+                        // function calls (LFM3, Qwen3 Coder) is held to that syntax
+                        // rather than to the JSON envelope, which it never writes.
+                        // Once a tool result has come back since the latest prompt,
+                        // it may answer in text instead of calling a tool, and that
+                        // text is the reply; before that, it must call one (see
+                        // `encodeXMLFunctionToolCallingGrammar`).
+                        let xmlFunctionParser = Self.xmlFunctionParser(
+                            for: context.configuration.toolCallFormat,
+                            grammar: requiredToolCallGrammar)
                         let toolCallingGrammar =
-                            try SchemaConverter.encodeToolCallingGrammar(
+                            xmlFunctionParser != nil
+                            ? try SchemaConverter.encodeXMLFunctionToolCallingGrammar(
+                                tools: requiredToolDefinitions,
+                                allowsText: TranscriptConverter.toolOutputFollowsLatestPrompt(
+                                    in: request.transcript))
+                            : try SchemaConverter.encodeToolCallingGrammar(
                                 tools: requiredToolDefinitions
                             )
                         // The inner JSON envelope is still needed separately to
@@ -1205,6 +1246,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
 
                         await emitRequiredToolCallEvent(
                             outputBuffer: outputBuffer,
+                            xmlFunctionParser: xmlFunctionParser,
+                            toolSpecs: toolSpecs,
+                            textReplyEntryID: entryID,
                             toolCallsEntryID: toolCallsEntryID,
                             channel: channel
                         )
@@ -2027,13 +2071,53 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         /// guided path emits a single `.toolCallDelta` with the arguments JSON
         /// and a freshly minted toolCallID.
         ///
-        /// Required mode never degrades malformed or partial output into a
-        /// response event.
+        /// With `xmlFunctionParser` (the grammar held the model to its XML
+        /// function syntax), the buffer is read by `readXMLFunctionOutput`.
+        /// A call is emitted as the tool call. Where the grammar allowed
+        /// text and the model replied in text instead, that text is emitted
+        /// as the response under `textReplyEntryID`, as the Core AI port of
+        /// LFM3-Omni does, so the caller can ask again for the call. A
+        /// `<tool_call>` that doesn't parse, such as a call cut off at the
+        /// token limit, emits nothing, as in the envelope path; the caller
+        /// gets `incompleteOutput` metadata when the limit was hit.
+        ///
+        /// Otherwise, required mode never degrades malformed or partial output
+        /// into a response event.
         private func emitRequiredToolCallEvent(
             outputBuffer: String,
+            xmlFunctionParser: (any ToolCallParser)? = nil,
+            toolSpecs: [[String: any Sendable]] = [],
+            textReplyEntryID: String? = nil,
             toolCallsEntryID: String,
             channel: LanguageModelExecutorGenerationChannel
         ) async {
+            if let xmlFunctionParser {
+                switch Self.readXMLFunctionOutput(
+                    outputBuffer, parser: xmlFunctionParser, toolSpecs: toolSpecs)
+                {
+                case .call(let name, let argumentsJSON):
+                    GuidedGenerationDiagnosticSink.current?.recordParse(
+                        parsedAsToolCall: true, parsedName: name)
+                    await Self.emitToolCall(
+                        id: UUID().uuidString,
+                        name: name,
+                        arguments: argumentsJSON,
+                        entryID: toolCallsEntryID,
+                        into: channel)
+                case .text(let text):
+                    GuidedGenerationDiagnosticSink.current?.recordParse(
+                        parsedAsToolCall: false, parsedName: nil)
+                    if let textReplyEntryID {
+                        await Self.emit(
+                            text: text, entryID: textReplyEntryID, destination: .response,
+                            into: channel)
+                    }
+                case .unreadableCall, .empty:
+                    GuidedGenerationDiagnosticSink.current?.recordParse(
+                        parsedAsToolCall: false, parsedName: nil)
+                }
+                return
+            }
             let unwrapped = Self.unwrapToolCallMarkers(outputBuffer)
             let data = Data(unwrapped.utf8)
             guard
@@ -2062,6 +2146,62 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 arguments: argumentsJSON,
                 entryID: toolCallsEntryID,
                 into: channel)
+        }
+
+        /// The parser for a required call held to the model's own XML function
+        /// syntax, or `nil` where the call is held to the JSON envelope: with
+        /// `.jsonEnvelope`, or for a format that isn't XML function calls.
+        static func xmlFunctionParser(
+            for format: ToolCallFormat?, grammar: MLXLanguageModel.RequiredToolCallGrammar
+        ) -> (any ToolCallParser)? {
+            guard grammar == .modelFormat else { return nil }
+            switch format {
+            case .xmlFunction?, .qwen35?:
+                return format?.createParser()
+            default:
+                return nil
+            }
+        }
+
+        /// What a required-mode output under the XML function grammar holds.
+        enum XMLFunctionOutput: Equatable {
+            /// One call, with its arguments as JSON.
+            case call(name: String, argumentsJSON: String)
+            /// Text and no call: the model's reply.
+            case text(String)
+            /// A `<tool_call>` that doesn't parse, such as a call cut off at
+            /// the token limit. Its markup is never a reply.
+            case unreadableCall
+            /// Only whitespace.
+            case empty
+        }
+
+        /// Reads `buffer`, the output of `encodeXMLFunctionToolCallingGrammar`.
+        ///
+        /// The call starts at its `<tool_call>`; any text before it (where the
+        /// grammar allows text) is dropped. It counts only once it's closed: the
+        /// grammar always ends a call with `</tool_call>`, so a call without it
+        /// was cut off, even where the parser would accept it. The format's own
+        /// parser reads it with the tools' schemas, so a parameter's text becomes
+        /// the type its schema declares. A buffer with no `<tool_call>` is a
+        /// text reply.
+        static func readXMLFunctionOutput(
+            _ buffer: String, parser: any ToolCallParser, toolSpecs: [[String: any Sendable]]
+        ) -> XMLFunctionOutput {
+            guard let start = buffer.range(of: "<tool_call>") else {
+                let text = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                return text.isEmpty ? .empty : .text(text)
+            }
+            let content = String(buffer[start.lowerBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard content.hasSuffix("</tool_call>"),
+                let call = parser.parse(content: content, tools: toolSpecs),
+                let argumentsData = try? JSONEncoder().encode(call.function.arguments),
+                let argumentsJSON = String(data: argumentsData, encoding: .utf8)
+            else {
+                return .unreadableCall
+            }
+            return .call(name: call.function.name, argumentsJSON: argumentsJSON)
         }
 
         /// Strips Qwen-style `<tool_call>\n...\n</tool_call>` wrapper markers
